@@ -1,0 +1,2852 @@
+#######################################################################################
+# Metric Provider : SAS Metrics Plug-in                                               #
+# Plugin Uses SAS dashboard data for computing SAS Metrics                            #
+# Output : Updates the RedShift Table and return the success status                    #
+#######################################################################################
+
+import re
+import os
+import sys
+import time
+import argparse
+from datetime import date
+from coral import coralrpc
+import coral.complex_types
+from retrying import retry
+from pyodinhttp import odin_retrieve_pair
+from dateutil.relativedelta import relativedelta
+from aee_oe_data_collector_aggregator_config.config.sas_config import *
+from aee_oe_data_collector_aggregator_config.config.logger import Logger
+from com.amazonaws.sasriskaggregationservice.sasriskaggregationservice import *
+from com.amazon.coral.availability.throttlingexception import ThrottlingException
+from aee_oe_data_collector_aggregator.utilities.downloadUploadToS3 import S3_Operations
+from aee_oe_data_collector_aggregator_config.config.basic_config import Common_Constants, ODIN, COMMANDS
+from aee_oe_data_collector_aggregator.utilities.redshift_operation_wrapper import redshift_operation_wrapper
+
+
+class SAS_Plugin:
+
+    def __init__(self):
+        Logger.printLogs("INFO","Triggering SAS Plugin")
+        self.rs_upsert = redshift_operation_wrapper()
+
+    def SAS_Init(Self):
+        # Fetching access key and secret key from admin ODIN
+        aws_access_key_id,aws_secret_access_key = odin_retrieve_pair(ODIN.AEE_ODIN)
+        aws_access_key_id = aws_access_key_id.data.decode('utf-8').encode()
+        aws_secret_access_key = aws_secret_access_key.data.decode('utf-8').encode()
+
+        # Creating orchestrator for client
+        _orchestrator = coralrpc.new_orchestrator(
+                         endpoint=SAS_Config.endpoint,
+                         aws_service=SAS_Config.service,
+                         aws_region=SAS_Config.region,
+                         signature_algorithm='v4',
+                         timeout=30, # 30 seconds why? New service so we don't know about the latency
+                         aws_access_key=aws_access_key_id,
+                         aws_secret_key=aws_secret_access_key,
+                         aws_security_token = SAS_Config.security_token)
+
+        # Creating SAS risk client
+        return SASRiskAggregationServiceClient(_orchestrator)
+
+    def _string_to_camelcase(self, s):
+        return re.sub(r'(?:^|_)(.)', lambda m: m.group(1).upper(), s)
+
+
+    def coral_to_python(self, obj):
+        if isinstance(obj, coral.complex_types.List):
+            return [self.coral_to_python(el) for el in obj]
+        if isinstance(obj, coral.complex_types.Structure):
+            required_string = {}
+            for propname in dir(obj):
+                if propname.startswith('_'):
+                    continue
+                required_string[self._string_to_camelcase(propname)] = self.coral_to_python(getattr(obj, propname))
+            return required_string
+        if isinstance(obj, coral.simple_types.String):
+            return str(obj)
+        if isinstance(obj, coral.simple_types.Boolean):
+            return bool(obj)
+        return obj
+
+    def get_entities(self):
+        '''
+        This function fetches the client names from Config file and returns client names.
+        '''
+        select_result = self.rs_upsert.run_redshift_select_query(SAS_Config.get_distinct_leader)
+        Logger.printLogs("DEBUG","Query result {}".format(select_result))
+        if select_result == 1:
+            Logger.printLogs("EXCEPTION","Query resulted in exception and returned {}".format(select_result))
+            sys.exit(1)
+
+        entities = []
+        for clients in select_result:
+            entities.append(clients[0])
+        if len(entities) < 2:
+            entities = str("('") + entities[0] + str("')")
+        else:
+            entities = tuple(entities)
+        return entities
+
+    def get_distinct_managers(self, entities):
+        '''
+        Based on the entities from get_entities function, this function fetches, all the employees under that login.
+        '''
+        try:
+            Logger.printLogs("INFO", " Calling Manager To Manager Aggregate Mapping Query")
+            manager_to_manager_aggregate_mapping = self.rs_upsert.run_redshift_select_query(SAS_Config.manager_to_manager_aggregate_mapping_query.format(entities))
+
+            if manager_to_manager_aggregate_mapping == 1:
+                Logger.printLogs("ERROR","Manager Aggregate relation Mapping query failed with Error code 1")
+                sys.exit(1)
+
+            if len(manager_to_manager_aggregate_mapping) < 1:
+                Logger.printLogs("WARNING","manager aggregate relation mapping is empty")
+
+            distinct_managers = set()
+            manager_to_entity_mapping = {}
+            for mapping in manager_to_manager_aggregate_mapping:
+                roll_up_to_manager = mapping[0]
+                manager = mapping[1]
+                if roll_up_to_manager in entities:
+                    distinct_managers.add(manager)
+                    manager_to_entity_mapping.update({manager:roll_up_to_manager})
+            return tuple(distinct_managers), manager_to_entity_mapping, manager_to_manager_aggregate_mapping
+
+        except Exception as error:
+            Logger.printLogs("[ ERROR ]","Getting distinct managers failed with error {}".format(error))
+            sys.exit(1)
+
+    def load_SAS_data_to_redshift(self, program_name):
+        '''
+        Truncate the rawdata tables and update the new rawdata in tables. 
+        Input: program_name i.e. type of SAS riks
+        '''
+        if (program_name == SAS_Config.program_name_apollo):
+            try:
+                os.system(COMMANDS.Redshift_Operations_Command.format(ODIN.Redshift_ODIN,"truncate table {}".format(SAS_Config.temp_redshift_apollo_table)))
+                Logger.printLogs("INFO","Truncate table '{}' completed successfully.".format(SAS_Config.temp_redshift_apollo_table))
+                os.system(COMMANDS.Redshift_Operations_Command.format(ODIN.Redshift_ODIN,"truncate table " + SAS_Config.redshift_apollo_table))
+                Logger.printLogs("INFO","Truncate table '{}' completed successfully.".format(SAS_Config.redshift_apollo_table))
+                os.system(COMMANDS.Redshift_Update_Comamnd.format(ODIN.Redshift_ODIN,"csv",SAS_Config.temp_redshift_apollo_table,Common_Constants.S3_Bucket+'/'+SAS_Config.sas_apollo_temp_s3_location))
+                Logger.printLogs("INFO","Data updation to table '{}' completed successfully.".format(SAS_Config.temp_redshift_apollo_table))
+                os.system(COMMANDS.Redshift_Operations_Command.format(ODIN.Redshift_ODIN,SAS_Config.query_for_getting_required_data.format(SAS_Config.redshift_apollo_table,SAS_Config.temp_redshift_apollo_table)))
+                Logger.printLogs("INFO","Unique Data updation to table '{}' completed successfully.".format(SAS_Config.redshift_apollo_table))
+
+            except Exception as error:
+                Logger.printLogs("[ ERROR ]","Transferring Apollo data to redshift table failed with message : {}".format(error))
+                sys.exit(1)
+
+        elif (program_name == SAS_Config.program_name_brazil):
+            try:
+                os.system(COMMANDS.Redshift_Operations_Command.format(ODIN.Redshift_ODIN,"truncate table {}".format(SAS_Config.temp_redshift_brazil_table)))
+                Logger.printLogs("INFO","Truncate table '{}' completed successfully.".format(SAS_Config.temp_redshift_brazil_table))
+                os.system(COMMANDS.Redshift_Operations_Command.format(ODIN.Redshift_ODIN,"truncate table " + SAS_Config.redshift_brazil_table))
+                Logger.printLogs("INFO","Truncate table '{}' completed successfully.".format(SAS_Config.redshift_brazil_table))
+                os.system(COMMANDS.Redshift_Update_Comamnd.format(ODIN.Redshift_ODIN,"csv",SAS_Config.temp_redshift_brazil_table,Common_Constants.S3_Bucket+'/'+SAS_Config.sas_brazil_temp_s3_location))
+                Logger.printLogs("INFO","Data updation to table '{}' completed successfully.".format(SAS_Config.redshift_brazil_table))
+                os.system(COMMANDS.Redshift_Operations_Command.format(ODIN.Redshift_ODIN,SAS_Config.query_for_getting_required_data.format(SAS_Config.redshift_brazil_table,SAS_Config.temp_redshift_brazil_table)))
+                Logger.printLogs("INFO","Unique Data updation to table '{}' completed successfully.".format(SAS_Config.redshift_brazil_table))
+
+            except Exception as error:
+                Logger.printLogs("[ ERROR ]","Transferring Brazil data to redshift table failed with message : {}".format(error))
+                sys.exit(1)
+
+        elif (program_name == SAS_Config.program_name_pipeline_targets):
+            try:
+                os.system(COMMANDS.Redshift_Operations_Command.format(ODIN.Redshift_ODIN,"truncate table {}".format(SAS_Config.temp_redshift_pipeline_target_table)))
+                Logger.printLogs("INFO","Truncate table '{}' completed successfully.".format(SAS_Config.temp_redshift_pipeline_target_table))
+                os.system(COMMANDS.Redshift_Operations_Command.format(ODIN.Redshift_ODIN,"truncate table " + SAS_Config.redshift_pipeline_target_table))
+                Logger.printLogs("INFO","Truncate table '{}' completed successfully.".format(SAS_Config.redshift_pipeline_target_table))
+                os.system(COMMANDS.Redshift_Update_Comamnd.format(ODIN.Redshift_ODIN,"csv",SAS_Config.temp_redshift_pipeline_target_table,Common_Constants.S3_Bucket+'/'+SAS_Config.sas_pipeline_target_temp_s3_location))
+                Logger.printLogs("INFO","Data updation to table '{}' completed successfully.".format(SAS_Config.temp_redshift_pipeline_target_table))
+                os.system(COMMANDS.Redshift_Operations_Command.format(ODIN.Redshift_ODIN,SAS_Config.query_for_getting_required_data.format(SAS_Config.redshift_pipeline_target_table,SAS_Config.temp_redshift_pipeline_target_table)))
+                Logger.printLogs("INFO","Unique Data updation to table '{}' completed successfully.".format(SAS_Config.redshift_pipeline_target_table))
+
+            except Exception as error:
+                Logger.printLogs("ERROR","Transferring Pipeline Target data to redshift table failed with message : {}".format(error))
+                sys.exit(1)
+        else:
+            Logger.printLogs("ERROR","Wrong Program name passed")
+            return
+
+    def create_metrics(self, _client, metric_snapshot):
+        '''
+        Main function, responsible to start generating metrics.
+        Input: 
+        _client: Client of SAS API
+        metric_snapshot: Type of metrics refresh i.e. WoW or MoM
+        '''
+        entities = self.get_entities()
+        distinct_managers, manager_to_entity_mapping, manager_to_manager_aggregate_mapping =self.get_distinct_managers(entities)
+        self.apollo_file = open(SAS_Config.sas_apollo_temp_file,"w")
+        self.brazil_file = open(SAS_Config.sas_brazil_temp_file,"w")
+        self.pipeline_file = open(SAS_Config.sas_pipeline_target_temp_file,"w")
+        self.metric_snapshot = metric_snapshot
+        Logger.printLogs("[INFO]","Executing it for all managers")
+        iterator = 0
+        for manager in distinct_managers:
+            Logger.printLogs("[UPDATE]","{} Managers left to process".format(len(distinct_managers)-iterator))
+            iterator = iterator+1
+
+            data = self.call_get_high_level_resource_details(manager, _client)
+
+            final_list_of_apollo_environments = []
+            final_list_of_brazil_environments = []
+            final_list_of_pipeline_targets = []
+
+            try:
+                apollo_result = self.coral_to_python(data)['HighLevelResourceDetailsByResourceTypeMap']['ApolloEnvironmentNameAndStage']
+                final_list_of_apollo_environments = self.process_high_level_data(apollo_result, SAS_Config.program_name_apollo)
+            except Exception as err:
+                Logger.printLogs("[INFO]","No Apollo SAS risk found ! {}".format(err))
+            try:
+                brazil_data = self.coral_to_python(data)['HighLevelResourceDetailsByResourceTypeMap']['BrazilVersionSet']
+                final_list_of_brazil_environments = self.process_high_level_data(brazil_data, SAS_Config.program_name_brazil)
+            except Exception as err:
+                Logger.printLogs("[INFO]","No Brazil version set SAS risk found ! {}".format(err))
+
+            try:
+                pipeline_target_data = self.coral_to_python(data)['HighLevelResourceDetailsByResourceTypeMap']['AmazonPipelineTarget']
+                final_list_of_pipeline_targets = self.process_high_level_data(pipeline_target_data, SAS_Config.program_name_pipeline_targets)
+            except Exception as err:
+                Logger.printLogs("[INFO]","No Pipeline target SAS risk found ! {}".format(err))
+
+            try:
+
+                self.call_batch_details_wrapper(manager, _client, final_list_of_apollo_environments, SAS_Config.program_name_apollo)
+
+                self.call_batch_details_wrapper(manager, _client, final_list_of_brazil_environments, SAS_Config.program_name_brazil)
+
+                self.call_batch_details_wrapper(manager,_client,final_list_of_pipeline_targets, SAS_Config.program_name_pipeline_targets)
+
+
+            except Exception as error:
+                Logger.printLogs("ERROR","Getting final details of SAS failed with error {}".format(error))
+                sys.exit(1)
+
+        self.apollo_file.close()
+        self.brazil_file.close()
+        self.pipeline_file.close()
+
+        try:
+            S3_Operations.uploadDataToS3(ODIN.S3_ODIN, Common_Constants.S3_Bucket, SAS_Config.sas_apollo_temp_s3_location, SAS_Config.sas_apollo_temp_file)
+            self.load_SAS_data_to_redshift(SAS_Config.program_name_apollo)
+        except Exception as err:
+            Logger.printLogs("[ERROR]","Error occurred while uploading Apollo csv file to S3 bucket. {}".format(err))
+            sys.exit(1)
+
+        try:
+            S3_Operations.uploadDataToS3(ODIN.S3_ODIN, Common_Constants.S3_Bucket, SAS_Config.sas_brazil_temp_s3_location, SAS_Config.sas_brazil_temp_file)
+            self.load_SAS_data_to_redshift(SAS_Config.program_name_brazil)
+        except Exception as err:
+            Logger.printLogs("[ERROR]","Error occurred while uploading Brazil csv file to S3 bucket. {}".format(err))
+            sys.exit(1)
+
+        try:
+            S3_Operations.uploadDataToS3(ODIN.S3_ODIN, Common_Constants.S3_Bucket, SAS_Config.sas_pipeline_target_temp_s3_location, SAS_Config.sas_pipeline_target_temp_file)
+            self.load_SAS_data_to_redshift(SAS_Config.program_name_pipeline_targets)
+        except Exception as err:
+            Logger.printLogs("[ERROR]","Error occurred while uploading Pipeline Target csv file to S3 bucket. {}".format(err))
+            sys.exit(1)
+
+        try:
+
+            Logger.printLogs("INFO","Starting Rolling up of SAS metrics")
+            roll_return_code = self.roll_up_metrics(distinct_managers)
+
+            Logger.printLogs("INFO","Starting Aggregating SAS metrics")
+            self.aggregate_metrics(distinct_managers)
+
+            Logger.printLogs("INFO","Updating refresh status of SAS metrics")
+            self.insert_success_refresh_status()
+
+            Logger.printLogs("INFO","Updating duplicate tables of SAS metrics for Manual update of OE Risks")
+            self.insert_sas_data_into_duplicate_table()
+
+        except Exception as err:
+            Logger.printLogs("ERROR","SAS Plug-in failed with error {}".format(err))
+            sys.exit(1)
+
+    def process_high_level_data(self, result, resource_type):
+        '''
+        Function is responsible to get all environments or resources from result and return consolidated list.
+        Input: Result, metric_snapshot and type of resource
+        Output: Consolidated list of Environments
+        '''
+        final_list_environments = []
+        for environment in result:
+            environment_json_info = self.coral_to_python(environment)
+            env_name = environment_json_info['ResourceName']
+            Logger.printLogs("[DEBUG]","{} environment {} added to list".format(resource_type, env_name))
+            final_list_environments.append(env_name)
+
+        return final_list_environments
+
+    def get_apollo_data_and_write_in_file(self, data, file, metric_snapshot):
+        '''
+        Fetches all the details from processed Apollo data and writes into a csv file.
+        '''
+        list_data = self.coral_to_python(data)
+        for filtered_depth_data in list_data['Details']:
+            env_name = filtered_depth_data['Name']
+            stage_name = env_name.split(':')[1]
+            owner_login = filtered_depth_data['OwnerLogin']
+            children_count = filtered_depth_data['ChildrenCount']
+            consumer_count = filtered_depth_data['ConsumerCount']
+            host_count = filtered_depth_data['HostCount']
+            owner = filtered_depth_data['Owner']
+            pipeline_id = filtered_depth_data['PipelineId']
+            pipeline_name = filtered_depth_data['PipelineName']
+            oldest_risk_age = filtered_depth_data['OldestRiskAge']
+            risk_count = filtered_depth_data['RiskCount']
+            visibility = filtered_depth_data['Visibility']
+            recommendation_with_action = {}
+            for recommendation in filtered_depth_data['Recommendations']:
+                for target_resource in recommendation['AssociatedTargetResources']:
+                    recommendation_with_action[target_resource] = recommendation['Template']
+
+            for software_risk in filtered_depth_data['SoftwareRisks']:
+                for risk_details in software_risk['SoftwareRiskDetails']:
+                    blocked_resources = risk_details['TargetResource']
+                    action_required = recommendation_with_action[blocked_resources]
+                    associated_campaigns = software_risk['AssociatedCampaign']['Name'].replace(",","")
+
+                    oldest_risk_age = risk_details['RiskAge']
+                    oldest_recommendation_age = str(risk_details['RecommendationAge'])
+
+                    if (not oldest_recommendation_age.isnumeric()):
+                        oldest_recommendation_age = '-1'
+
+                    current_date = date.today()
+                    snapshot_number = current_date.isocalendar()[1]
+                    classification = 'None'
+                    curent_year = current_date.strftime('%Y')
+                    file.write("{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n".format(env_name,
+                                                                                                         stage_name,
+                                                                                                         pipeline_id,
+                                                                                                         pipeline_name,
+                                                                                                         owner,
+                                                                                                         owner_login,
+                                                                                                         consumer_count,
+                                                                                                         children_count,
+                                                                                                         risk_count,
+                                                                                                         visibility,
+                                                                                                         host_count,
+                                                                                                         oldest_risk_age,
+                                                                                                         oldest_recommendation_age,
+                                                                                                         action_required,
+                                                                                                         blocked_resources,
+                                                                                                         associated_campaigns,
+                                                                                                         current_date,
+                                                                                                         curent_year,
+                                                                                                         classification,
+                                                                                                         metric_snapshot,
+                                                                                                         snapshot_number))
+
+    def get_brazil_data_and_write_in_file(self, data, file, metric_snapshot):
+        '''
+        Fetches all the details from processed Brazil data and writes into a csv file.
+        '''
+        list_data = self.coral_to_python(data)
+        for version_set_json_info in list_data['Details']:
+            version_set = version_set_json_info['Name']
+            owner_login = version_set_json_info['OwnerLogin']
+            owner = version_set_json_info['Owner']
+
+            pipeline_id = version_set_json_info['PipelineId']
+            pipeline_name = version_set_json_info['PipelineName']
+            oldest_recommendation_age = version_set_json_info['OldestRecommendationAge']
+            oldest_risk_age = version_set_json_info['OldestRiskAge']
+            risk_count = version_set_json_info['RiskCount']
+
+            recommendation_with_action = {}
+            for recommendation in version_set_json_info['Recommendations']:
+                for target_resource in recommendation['Actions']:
+                    recommendation_with_action[recommendation['TargetResource']] = target_resource['Template']
+
+            for software_risk in version_set_json_info['SoftwareRisks']:
+                for risk_details in software_risk['SoftwareRiskDetails']:
+                    blocked_resources = risk_details['TargetResource']
+                    try:
+                        action_required = recommendation_with_action[blocked_resources]
+                    except Exception as err:
+                        action_required = 'None'
+                    associated_campaigns = software_risk['AssociatedCampaign']['Name']
+                    oldest_risk_age = risk_details['RiskAge']
+                    oldest_recommendation_age = str(risk_details['RecommendationAge'])
+
+                    if (not oldest_recommendation_age.isnumeric()):
+                        oldest_recommendation_age = '-1'
+
+                    current_date = date.today()
+                    snapshot_number = current_date.isocalendar()[1]
+                    classification = 'None'
+                    curent_year = current_date.strftime('%Y')
+                    file.write("{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n".format(version_set,
+                                                                                          pipeline_id,
+                                                                                          pipeline_name,
+                                                                                          owner,
+                                                                                          owner_login,
+                                                                                          risk_count,
+                                                                                          oldest_risk_age,
+                                                                                          oldest_recommendation_age,
+                                                                                          blocked_resources,
+                                                                                          action_required,
+                                                                                          associated_campaigns,
+                                                                                          current_date,
+                                                                                          curent_year,
+                                                                                          classification,
+                                                                                          metric_snapshot,
+                                                                                          snapshot_number))
+
+    def get_pipeline_target_data_and_write_in_file(self, data, file, metric_snapshot):
+        '''
+        Fetches all the details from processed pipeline target data and writes into a csv file.
+        '''
+        list_data = self.coral_to_python(data)
+        for pipeline_target_json_info in list_data['Details']:
+            target_name = pipeline_target_json_info['Name']
+            pipeline_name = pipeline_target_json_info['PipelineName']
+            pipeline_id = pipeline_target_json_info['PipelineId']
+            owner_name = pipeline_target_json_info['Owner']
+            owner_login = pipeline_target_json_info['OwnerLogin']
+            oldest_risk_age = pipeline_target_json_info['OldestRiskAge']
+            risk_count = pipeline_target_json_info['RiskCount']
+
+            recommendation_with_action = {}
+
+            try:
+                for recommendation in pipeline_target_json_info['Recommendations']:
+                    for target_resource in recommendation['Actions']:
+                        recommendation_with_action[recommendation['TargetResource']] = target_resource['Template']
+            except Exception as err:
+                Logger.printLogs("INFO", "Please Refer to Associated campaign urls to follow the recommendation")
+
+            for software_risk in pipeline_target_json_info['SoftwareRisks']:
+                for risk_details in software_risk['SoftwareRiskDetails']:
+                    blocked_resources = risk_details['TargetResource']
+                try:
+                    action_required = recommendation_with_action[blocked_resources]
+                except Exception as err:
+                    action_required = 'None'
+                associated_campaigns = software_risk['AssociatedCampaign']['Name']
+                oldest_risk_age = risk_details['RiskAge']
+
+                try:
+                    oldest_recommendations_age = str(risk_details['RecommendationAge'])
+                except Exception:
+                    Logger.printLogs("INFO","Recommendation Age is not configured in Pipeline Target plug-in, setting default value")
+                    oldest_recommendations_age = '-1'
+
+                current_date = date.today()
+                snapshot_number = current_date.isocalendar()[1]
+                classification = 'None'
+                current_year = current_date.strftime('%Y')
+
+                file.write("{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n".format(target_name,
+                                                                                      pipeline_id,
+                                                                                      pipeline_name,
+                                                                                      owner_name,
+                                                                                      owner_login,
+                                                                                      risk_count,
+                                                                                      oldest_risk_age,
+                                                                                      oldest_recommendations_age,
+                                                                                      blocked_resources,
+                                                                                      action_required,
+                                                                                      associated_campaigns,
+                                                                                      current_date,
+                                                                                      current_year,
+                                                                                      classification,
+                                                                                      metric_snapshot,
+                                                                                      snapshot_number
+                                                                                      ))
+
+    @retry(wait_fixed=10000, stop_max_attempt_number=3)
+    def call_get_high_level_resource_details(self, manager, _client):
+        '''
+        Makes API call to get the high level SAS risk details for any particular manager. It includes all Blocked SAS risks.
+        '''
+        try:
+            data = _client.get_resource_high_level_risk_details_by_campaign_type(aggregate_id = "Person:"+manager, campaign_type='BLOCKED')
+
+        except ThrottlingException as e:
+            Logger.printLogs("EXCEPTION","ThrottlingException occurred, Sleeping! {}".format(e))
+            time.sleep(5)
+        except Exception as err:
+            Logger.printLogs("[ERROR]","Error occurred {}".format(err))
+            return 1
+
+        return data
+
+    def call_batch_details_wrapper(self, manager, _client, final_list_of_environments, type_of_env):
+        '''
+        This is the wrapper function, which is responsible to limit the batch size to 100 of every request.
+        '''
+        batch_iterations = len(final_list_of_environments)// SAS_Config.BATCH_SIZE +1
+        Logger.printLogs("[INFO]","Inside Call Batch Wrapper function: Total Batches required {}".format(batch_iterations))
+
+        try:
+            for start_range in range(0,len(final_list_of_environments),SAS_Config.BATCH_SIZE):
+                end_range = start_range + SAS_Config.BATCH_SIZE
+
+                consolidated_data = self.call_batch_details(manager, _client, final_list_of_environments[start_range:end_range], type_of_env)
+
+                if type_of_env == SAS_Config.program_name_apollo and consolidated_data != 1:
+                    self.get_apollo_data_and_write_in_file(consolidated_data, self.apollo_file, self.metric_snapshot)
+                elif type_of_env == SAS_Config.program_name_brazil and consolidated_data != 1:
+                    self.get_brazil_data_and_write_in_file(consolidated_data, self.brazil_file, self.metric_snapshot)
+                elif type_of_env == SAS_Config.program_name_pipeline_targets and consolidated_data != 1:
+                    self.get_pipeline_target_data_and_write_in_file(consolidated_data, self.pipeline_file, self.metric_snapshot)
+
+        except Exception as err:
+            Logger.printLogs("[ERROR]","Error occurred {}".format(err))
+            sys.exit(1)
+
+        return
+
+
+    @retry(wait_fixed=10000, stop_max_attempt_number=3)
+    def call_batch_details(self, manager, _client, final_list_of_environments, type_of_env):
+        '''
+        This function takes list of environments as input and fetches all detailed information.
+        '''
+        Logger.printLogs("[DEBUG]","Batch Length is {}".format(len(final_list_of_environments)))
+        try:
+            if (type_of_env == SAS_Config.program_name_apollo):
+                data = _client.batch_get_apollo_environment_stage_details(requester_login = manager, entity_id_list=final_list_of_environments, campaign_type='BLOCKED')
+            elif (type_of_env == SAS_Config.program_name_brazil):
+                data = _client.batch_get_brazil_version_set_details(requester_login = manager, entity_id_list=final_list_of_environments, campaign_type='BLOCKED')
+            elif (type_of_env == SAS_Config.program_name_pipeline_targets):
+                data = _client.batch_get_pipeline_target_resource_details(requester_login = manager, entity_id_list = final_list_of_environments, campaign_type = 'BLOCKED')
+            else:
+                Logger.printLogs("ERROR","Wrong type_of_env is passed, Please check! ")
+
+        except ThrottlingException as error:
+            Logger.printLogs("EXCEPTION","ThrottlingException occurred, Sleeping! {}".format(error))
+            time.sleep(5)
+        except Exception as err:
+            Logger.printLogs("[ERROR]","Error occurred {}".format(err))
+            return 1
+
+        return data
+
+    def roll_up_metrics(self, distinct_managers):
+        '''
+        Function responsible for Rolling up the metrics by using Rawdata tables.
+        '''
+        Logger.printLogs("[INFO]","Starting rolling up of SAS metrics")
+
+        for manager in distinct_managers:
+
+
+            insert_apollo_result = self.rs_upsert.execute_redshift_sql_query(SAS_Config.roll_upto_manager_query.format(SAS_Config.rolled_redshift_apollo_table,
+                                                                                                          manager,
+                                                                                                          SAS_Config.redshift_apollo_table))
+            Logger.printLogs("[DEBUG]","Apollo Data rolled upto query for {} manager result {}".format(manager, insert_apollo_result))
+
+
+            insert_brazil_result = self.rs_upsert.execute_redshift_sql_query(SAS_Config.roll_upto_manager_query.format(SAS_Config.rolled_redshift_brazil_table,
+                                                                                                          manager,
+                                                                                                          SAS_Config.redshift_brazil_table))
+            Logger.printLogs("[DEBUG]","Brazil Data rolled upto query for {} manager result {}".format(manager, insert_brazil_result))
+
+
+            insert_pipeline_target_result = self.rs_upsert.execute_redshift_sql_query(SAS_Config.roll_upto_manager_query.format(SAS_Config.rolled_redshift_pipeline_target_table,
+                                                                                                          manager,
+                                                                                                          SAS_Config.redshift_pipeline_target_table))
+            Logger.printLogs("[DEBUG]","Pipeline Target Data rolled upto query for {} manager result {}".format(manager, insert_pipeline_target_result))
+
+            if (insert_apollo_result != 0 or insert_brazil_result != 0 or insert_pipeline_target_result != 0):
+                Logger.printLogs("ERROR","Query failed to roll the data for manager {}".format(manager))
+                sys.exit(1)
+
+
+
+    def aggregate_metrics(self, distinct_managers):
+        '''
+        This function creates Aggregate metrics from the Rolled up data
+        '''
+        Logger.printLogs("[INFO]","Starting Aggregate Rolled up of SAS metrics")
+        manager_processed = 0
+        for manager in distinct_managers:
+
+            manager_processed = manager_processed + 1
+
+            Logger.printLogs("[DEBUG]","Manager processed [{}]/[{}]".format(manager_processed,len(distinct_managers)))
+
+
+            insert_total_result = self.rs_upsert.execute_redshift_sql_query(SAS_Config.aggregate_roll_upto_total_query.format(SAS_Config.sas_aggregate_table, manager))
+            Logger.printLogs("[DEBUG]","Total Metrics rolled upto {} manager query result {}".format(manager, insert_total_result))
+
+
+            insert_recommended_result = self.rs_upsert.execute_redshift_sql_query(SAS_Config.aggregate_roll_upto_recommendation_query.format(SAS_Config.sas_aggregate_table, manager))
+            Logger.printLogs("[DEBUG]","Recommendations Metrics rolled upto {} manager query result {}".format(manager, insert_recommended_result))
+
+
+            insert_older_recommendation_result = self.rs_upsert.execute_redshift_sql_query(SAS_Config.aggregate_roll_upto_long_recommendation_query.format(SAS_Config.sas_aggregate_table, manager))
+            Logger.printLogs("[DEBUG]","Recommendations Metrics rolled upto {} manager query result {}".format(manager, insert_older_recommendation_result))
+
+
+            insert_recommended_result = self.rs_upsert.execute_redshift_sql_query(SAS_Config.aggregate_roll_upto_near_sla_query.format(SAS_Config.sas_aggregate_table, manager))
+            Logger.printLogs("[DEBUG]","SLA near missed Metrics rolled upto {} manager query result {}".format(manager, insert_recommended_result))
+
+            if (insert_total_result !=0 or insert_recommended_result != 0 or insert_older_recommendation_result != 0):
+                Logger.printLogs("ERROR","Aggregation Query Execution failed for manager {}".format(manager))
+                sys.exit(1)
+
+
+
+    def insert_success_refresh_status(self):
+        '''
+        Updates the refresh status when plug-in runs successfullly.
+        '''
+
+        try:
+            next_run_date = date.today() + relativedelta(days=7)
+            insert_status = self.rs_upsert.execute_redshift_sql_query(SAS_Config.insert_status_of_sas_run.format(date.today(), date.today(),next_run_date))
+            Logger.printLogs("DEBUG","Status Insertion Query result {}".format(insert_status))
+
+        except Exception as error:
+            Logger.printLogs("ERROR","Inserting refresh status failed with message: {}".format(error))
+            sys.exit(1)
+
+    def insert_sas_data_into_duplicate_table(self):
+        '''
+        Inserting data into respective SAS tables for Manual OE risk update in Amazon Arik portal.
+        '''
+        try:
+            #Adding SAS Apollo data to duplicate table for Manual update of SAS Risks [AmazonArik OE Risk]
+            insert_status_apollo = self.rs_upsert.execute_redshift_sql_query(SAS_Config.sas_temp_apollo_insert_query)
+            Logger.printLogs("INFO","Data update to duplicate apollo sas table '{}' completed successfully {}.".format(SAS_Config.redshift_apollo_table_v2, insert_status_apollo))
+
+            #Adding SAS Brazil data to duplicate table for Manual update of SAS Risks [AmazonArik OE Risk]
+            insert_status_brazil = self.rs_upsert.execute_redshift_sql_query(SAS_Config.sas_temp_brazil_insert_query)
+            Logger.printLogs("INFO","Data update to duplicate brazil sas table '{}' completed successfully {}.".format(SAS_Config.redshift_brazil_table_v2, insert_status_brazil))
+
+            #Adding SAS Pipeline Target data to duplicate table for Manual update of SAS Risks [AmazonArik OE Risk]
+            insert_status_pipeline_target = self.rs_upsert.execute_redshift_sql_query(SAS_Config.sas_temp_pipeline_target_insert_query)
+            Logger.printLogs("INFO","Data update to duplicate Pipeline target sas table '{}' completed successfully {}.".format(SAS_Config.redshift_pipeline_target_table_v2, insert_status_pipeline_target))
+
+        except Exception as error:
+            Logger.printLogs("ERROR","Inserting into duplicate table status failed with message: {}".format(error))
+            sys.exit(1)
+
+def main():
+    obj = SAS_Plugin()
+    _client = obj.SAS_Init()
+    parser = argparse.ArgumentParser(description='Getting the Snapshot type of SAS Plug-in')
+    parser.add_argument('-s', '--snapshot',  nargs="*", help='Plugin Snapshot Type: WoW / MoM', required=True)
+    args = vars(parser.parse_args())
+    metric_snapshot = args['snapshot'][0]
+    obj.create_metrics(_client, metric_snapshot)
+
+if __name__ == "__main__":
+    main()
+
+—————————————————————————————————————
+Config:
+class SAS_Config:
+
+    region = "us-west-2"
+
+    security_token = None
+
+    service = "sas-rags-frontend-prod"
+
+    endpoint = "https://sas-rags-frontend-prod-global-pdx.pdx.proxy.amazon.com"
+    
+    sas_aggregate_table = "aggregate_schema.sas_risk_summary"
+
+    sas_apollo_temp_s3_location = "P0_metrics_raw_data/SAS/SAS_Apollo_File.csv"
+
+    sas_brazil_temp_s3_location = "P0_metrics_raw_data/SAS/SAS_Brazil_File.csv"
+
+    sas_pipeline_target_temp_s3_location = "P0_metrics_raw_data/SAS/SAS_Pipeline_Target_File.csv"
+
+    sas_apollo_temp_file = "/apollo/env/AEE-OE-Data-Collector-Aggregator/var/SAS_Apollo_File.csv"
+
+    sas_brazil_temp_file = "/apollo/env/AEE-OE-Data-Collector-Aggregator/var/SAS_Brazil_File.csv"
+
+    sas_pipeline_target_temp_file = "/apollo/env/AEE-OE-Data-Collector-Aggregator/var/SAS_Pipeline_Target_File.csv"
+
+    sas_status_query = """insert into rawdata_schema.page0_plugin_run_status values('{}','{}','{}','{}','{}','{}','{}','{}','{}','{}')"""
+
+    redshift_apollo_table = "rawdata_schema.raw_sas_apollo_metrics"
+
+    redshift_brazil_table = "rawdata_schema.raw_sas_brazil_metrics"
+
+    redshift_pipeline_target_table = "rawdata_schema.raw_sas_pipeline_target_metrics"
+
+    redshift_apollo_table_v2 = "rawdata_schema.sas_apollo_metrics_v2"
+
+    redshift_brazil_table_v2 = "rawdata_schema.sas_brazil_metrics_v2"
+
+    redshift_pipeline_target_table_v2 = "rawdata_schema.sas_pipeline_target_metrics_v2"
+
+    temp_redshift_apollo_table = "rawdata_schema.temp_sas_apollo_metrics"
+
+    temp_redshift_brazil_table = "rawdata_schema.temp_sas_brazil_metrics"
+
+    temp_redshift_pipeline_target_table = "rawdata_schema.temp_sas_pipeline_target_metrics"
+
+    rolled_redshift_apollo_table = "rawdata_schema.sas_apollo_metrics"
+
+    rolled_redshift_brazil_table = "rawdata_schema.sas_brazil_metrics"
+
+    rolled_redshift_pipeline_target_table = "rawdata_schema.sas_pipeline_target_metrics"
+
+    program_name_apollo = 'APOLLO'
+
+    program_name_brazil = 'BRAZIL'
+
+    program_name_pipeline_targets = 'PIPELINE_TARGET'
+
+    pipeline_target_function_flag = 'PIPELINE_TARGET_FUNCTION'
+
+    BATCH_SIZE = 100
+
+    query_for_getting_required_data = """insert into {} select distinct * from {}"""
+
+    get_distinct_leader = "select distinct leader from relationship_schema.p0_clients_primary"
+
+    insert_status_of_sas_run = """ 
+    insert into rawdata_schema.page0_plugin_run_status 
+    values('ALLORG','ALLManager','','SAS','SAS Risks',0,'{}','{}','Weekly','{}');
+    """
+
+    manager_to_manager_aggregate_mapping_query = """
+    select relation_entity,relation_manager FROM 
+    relationship_schema.entity_manager_relationship WHERE relation_entity IN (SELECT DISTINCT relation_manager FROM 
+    relationship_schema.entity_manager_relationship WHERE relation_entity IN {0}) and 
+    relation_rundate in (select max(relation_rundate) from relationship_schema.entity_manager_relationship)"""
+
+    roll_upto_manager_query = """
+    insert into {0}
+    select *,
+           '{1}' AS rolled_upto
+    FROM {2}
+    WHERE owner_login IN (SELECT DISTINCT login_name
+                      FROM BOOKER.D_EMPLOYEE_DETAILS
+                      WHERE supervisor_login_name IN (SELECT DISTINCT relation_manager
+                                                      FROM relationship_schema.entity_manager_relationship
+                                                      WHERE relation_entity = '{1}'))
+    UNION all
+    SELECT *,
+           '{1}' AS rolled_upto
+    FROM {2}
+    WHERE owner_login = '{1}'
+    """
+
+    aggregate_roll_upto_total_query ="""
+    insert into {0} (
+    select count(risk_name) as risk_count,aggregate_roll_up_to,metric_run_date,
+    metric_snapshot,metric_snapshot_number,'{1}' as aggregate_rolled_upto,metric_year,'total' as metric_type 
+    from (
+    select apollo_environment_name as risk_name,aggregate_roll_up_to,metric_run_date,metric_snapshot,
+    metric_snapshot_number,metric_year,days_non_compliant,days_non_compliant_recommendation,apollo_action as action_type
+    from rawdata_schema.sas_apollo_metrics where metric_run_date = 
+    (select max(metric_run_date) from rawdata_schema.sas_apollo_metrics) and aggregate_roll_up_to in 
+    (SELECT DISTINCT login_name
+                          FROM BOOKER.D_EMPLOYEE_DETAILS
+                          WHERE supervisor_login_name IN ('{1}'))
+    union all
+    select brazil_versionset_name as risk_name,aggregate_roll_up_to,metric_run_date,metric_snapshot,
+    metric_snapshot_number,metric_year,days_non_compliant,days_non_compliant_recommendation,brazil_action_type as action_type
+     from rawdata_schema.sas_brazil_metrics where metric_run_date = 
+    (select max(metric_run_date) from rawdata_schema.sas_brazil_metrics) and aggregate_roll_up_to in
+    (SELECT DISTINCT login_name
+                          FROM BOOKER.D_EMPLOYEE_DETAILS
+                          WHERE supervisor_login_name IN ('{1}'))
+    union all
+    select pipeline_target_name as risk_name,aggregate_roll_up_to,metric_run_date,metric_snapshot,
+    metric_snapshot_number,metric_year,days_non_compliant,days_non_compliant_recommendation,pipeline_target_action_type as action_type
+    from rawdata_schema.sas_pipeline_target_metrics where metric_run_date = 
+    (select max(metric_run_date) from rawdata_schema.sas_pipeline_target_metrics) and aggregate_roll_up_to in 
+    (SELECT DISTINCT login_name
+                          FROM BOOKER.D_EMPLOYEE_DETAILS
+                          WHERE supervisor_login_name IN ('{1}')))
+    group by aggregate_roll_up_to,metric_run_date,metric_snapshot,aggregate_rolled_upto,metric_year,metric_snapshot_number
+    union all
+    select count(risk_name) as risk_count,aggregate_roll_up_to,metric_run_date,
+    metric_snapshot,metric_snapshot_number,'{1}' as aggregate_rolled_upto,metric_year,'total' as metric_type 
+    from (
+    select apollo_environment_name as risk_name,aggregate_roll_up_to,metric_run_date,metric_snapshot,
+    metric_snapshot_number,metric_year,days_non_compliant,days_non_compliant_recommendation,apollo_action as action_type
+    from rawdata_schema.sas_apollo_metrics where metric_run_date = 
+    (select max(metric_run_date) from rawdata_schema.sas_apollo_metrics) and aggregate_roll_up_to in ('{1}')
+    union all
+    select brazil_versionset_name as risk_name,aggregate_roll_up_to,metric_run_date,metric_snapshot,
+    metric_snapshot_number,metric_year,days_non_compliant,days_non_compliant_recommendation,brazil_action_type as action_type
+     from rawdata_schema.sas_brazil_metrics where metric_run_date = 
+    (select max(metric_run_date) from rawdata_schema.sas_brazil_metrics) and aggregate_roll_up_to in ('{1}')
+    union all
+    select pipeline_target_name as risk_name,aggregate_roll_up_to,metric_run_date,metric_snapshot,
+    metric_snapshot_number,metric_year,days_non_compliant,days_non_compliant_recommendation,pipeline_target_action_type as action_type
+    from rawdata_schema.sas_pipeline_target_metrics where metric_run_date = 
+    (select max(metric_run_date) from rawdata_schema.sas_pipeline_target_metrics) and aggregate_roll_up_to in ('{1}'))
+    group by aggregate_roll_up_to,metric_run_date,metric_snapshot,aggregate_roll_up_to,metric_year,metric_snapshot_number)
+    """
+
+    aggregate_roll_upto_near_sla_query = """
+    insert into {0} (
+    select count(risk_name) as risk_count,aggregate_roll_up_to,metric_run_date,
+    metric_snapshot,metric_snapshot_number,'{1}' as aggregate_rolled_upto,metric_year,'75DaySASRisk' as metric_type 
+    from (
+    select apollo_environment_name as risk_name,aggregate_roll_up_to,metric_run_date,metric_snapshot,
+    metric_snapshot_number,metric_year,days_non_compliant,days_non_compliant_recommendation,apollo_action as action_type
+    from rawdata_schema.sas_apollo_metrics where metric_run_date = (select max(metric_run_date) from rawdata_schema.sas_apollo_metrics) and aggregate_roll_up_to in 
+    (SELECT DISTINCT login_name
+                          FROM BOOKER.D_EMPLOYEE_DETAILS
+                          WHERE supervisor_login_name IN ('{1}'))  and 
+        cast(days_non_compliant_recommendation as int) >= 20 and 
+        cast(days_non_compliant_recommendation as int) < 30
+    union all
+    select brazil_versionset_name as risk_name,aggregate_roll_up_to,metric_run_date,metric_snapshot,
+    metric_snapshot_number,metric_year,days_non_compliant,days_non_compliant_recommendation,brazil_action_type as action_type
+     from rawdata_schema.sas_brazil_metrics where metric_run_date = (select max(metric_run_date) from rawdata_schema.sas_apollo_metrics) and aggregate_roll_up_to in
+    (SELECT DISTINCT login_name
+                          FROM BOOKER.D_EMPLOYEE_DETAILS
+                          WHERE supervisor_login_name IN ('{1}')) and 
+        cast(days_non_compliant_recommendation as int) >= 20 and 
+        cast(days_non_compliant_recommendation as int) < 30)
+    group by aggregate_roll_up_to,metric_run_date,metric_snapshot,aggregate_rolled_upto,metric_year,metric_snapshot_number
+    union all
+    select count(risk_name) as risk_count,aggregate_roll_up_to,metric_run_date,
+    metric_snapshot,metric_snapshot_number,'{1}' as aggregate_rolled_upto,metric_year,'75DaySASRisk' as metric_type 
+    from (
+    select apollo_environment_name as risk_name,aggregate_roll_up_to,metric_run_date,metric_snapshot,
+    metric_snapshot_number,metric_year,days_non_compliant,days_non_compliant_recommendation,apollo_action as action_type
+    from rawdata_schema.sas_apollo_metrics where metric_run_date = (select max(metric_run_date) from rawdata_schema.sas_apollo_metrics) and aggregate_roll_up_to in ('{1}')  and 
+        cast(days_non_compliant_recommendation as int) >= 20 and 
+        cast(days_non_compliant_recommendation as int) < 30
+    union all
+    select brazil_versionset_name as risk_name,aggregate_roll_up_to,metric_run_date,metric_snapshot,
+    metric_snapshot_number,metric_year,days_non_compliant,days_non_compliant_recommendation,brazil_action_type as action_type
+     from rawdata_schema.sas_brazil_metrics where metric_run_date = (select max(metric_run_date) from rawdata_schema.sas_apollo_metrics) and aggregate_roll_up_to in ('{1}')  and 
+        cast(days_non_compliant_recommendation as int) >= 20 and 
+        cast(days_non_compliant_recommendation as int) < 30)
+    group by aggregate_roll_up_to,metric_run_date,metric_snapshot,aggregate_roll_up_to,metric_year,metric_snapshot_number)
+    """
+
+    aggregate_roll_upto_recommendation_query = """
+    insert into {0} (
+    select count(risk_name) as risk_count,aggregate_roll_up_to,metric_run_date,
+    metric_snapshot,metric_snapshot_number,'{1}' as aggregate_rolled_upto,metric_year,'recommendations' as metric_type 
+    from (
+    select apollo_environment_name as risk_name,aggregate_roll_up_to,metric_run_date,metric_snapshot,
+    metric_snapshot_number,metric_year,days_non_compliant,days_non_compliant_recommendation,apollo_action as action_type
+    from rawdata_schema.sas_apollo_metrics where metric_run_date = (select max(metric_run_date) from rawdata_schema.sas_apollo_metrics)
+    and aggregate_roll_up_to in 
+    (SELECT DISTINCT login_name
+                          FROM BOOKER.D_EMPLOYEE_DETAILS
+                          WHERE supervisor_login_name IN ('{1}'))  and 
+        cast(days_non_compliant_recommendation as int) > 0
+    union all
+    select brazil_versionset_name as risk_name,aggregate_roll_up_to,metric_run_date,metric_snapshot,
+    metric_snapshot_number,metric_year,days_non_compliant,days_non_compliant_recommendation,brazil_action_type as action_type
+     from rawdata_schema.sas_brazil_metrics where metric_run_date = 
+    (select max(metric_run_date) from rawdata_schema.sas_apollo_metrics) and aggregate_roll_up_to in
+    (SELECT DISTINCT login_name
+                          FROM BOOKER.D_EMPLOYEE_DETAILS
+                          WHERE supervisor_login_name IN ('{1}')) and 
+        cast(days_non_compliant_recommendation as int) > 0)
+    group by aggregate_roll_up_to,metric_run_date,metric_snapshot,aggregate_rolled_upto,metric_year,metric_snapshot_number
+    union all
+    select count(risk_name) as risk_count,aggregate_roll_up_to,metric_run_date,
+    metric_snapshot,metric_snapshot_number,'{1}' as aggregate_rolled_upto,metric_year,'recommendations' as metric_type 
+    from (
+    select apollo_environment_name as risk_name,aggregate_roll_up_to,metric_run_date,metric_snapshot,
+    metric_snapshot_number,metric_year,days_non_compliant,days_non_compliant_recommendation,apollo_action as action_type
+    from rawdata_schema.sas_apollo_metrics where metric_run_date = 
+    (select max(metric_run_date) from rawdata_schema.sas_apollo_metrics) and aggregate_roll_up_to in ('{1}')  and 
+        cast(days_non_compliant_recommendation as int) > 0
+    union all
+    select brazil_versionset_name as risk_name,aggregate_roll_up_to,metric_run_date,metric_snapshot,
+    metric_snapshot_number,metric_year,days_non_compliant,days_non_compliant_recommendation,brazil_action_type as action_type
+     from rawdata_schema.sas_brazil_metrics where metric_run_date = 
+    (select max(metric_run_date) from rawdata_schema.sas_apollo_metrics) and aggregate_roll_up_to in ('{1}')  and 
+        cast(days_non_compliant_recommendation as int) > 0)
+    group by aggregate_roll_up_to,metric_run_date,metric_snapshot,aggregate_roll_up_to,metric_year,metric_snapshot_number)
+    """
+
+    aggregate_roll_upto_long_recommendation_query = """
+    insert into {0} (
+    select count(risk_name) as risk_count,aggregate_roll_up_to,metric_run_date,
+    metric_snapshot,metric_snapshot_number,'{1}' as aggregate_rolled_upto,metric_year,'90DaySASRisk' as metric_type 
+    from (
+    select apollo_environment_name as risk_name,aggregate_roll_up_to,metric_run_date,metric_snapshot,
+    metric_snapshot_number,metric_year,days_non_compliant,days_non_compliant_recommendation,apollo_action as action_type
+    from rawdata_schema.sas_apollo_metrics where metric_run_date = 
+    (select max(metric_run_date) from rawdata_schema.sas_apollo_metrics) and aggregate_roll_up_to in 
+    (SELECT DISTINCT login_name
+                          FROM BOOKER.D_EMPLOYEE_DETAILS
+                          WHERE supervisor_login_name IN ('{1}'))  and 
+        cast(days_non_compliant_recommendation as int) > 30
+    union all
+    select brazil_versionset_name as risk_name,aggregate_roll_up_to,metric_run_date,metric_snapshot,
+    metric_snapshot_number,metric_year,days_non_compliant,days_non_compliant_recommendation,brazil_action_type as action_type
+     from rawdata_schema.sas_brazil_metrics where metric_run_date = 
+    (select max(metric_run_date) from rawdata_schema.sas_brazil_metrics) and aggregate_roll_up_to in
+    (SELECT DISTINCT login_name
+                          FROM BOOKER.D_EMPLOYEE_DETAILS
+                          WHERE supervisor_login_name IN ('{1}')) and 
+        cast(days_non_compliant_recommendation as int) > 30)
+    group by aggregate_roll_up_to,metric_run_date,metric_snapshot,aggregate_rolled_upto,metric_year,metric_snapshot_number
+    union all
+    select count(risk_name) as risk_count,aggregate_roll_up_to,metric_run_date,
+    metric_snapshot,metric_snapshot_number,'{1}' as aggregate_rolled_upto,metric_year,'90DaySASRisk' as metric_type 
+    from (
+    select apollo_environment_name as risk_name,aggregate_roll_up_to,metric_run_date,metric_snapshot,
+    metric_snapshot_number,metric_year,days_non_compliant,days_non_compliant_recommendation,apollo_action as action_type
+    from rawdata_schema.sas_apollo_metrics where metric_run_date = 
+    (select max(metric_run_date) from rawdata_schema.sas_apollo_metrics) and aggregate_roll_up_to in ('{1}')  and 
+        cast(days_non_compliant_recommendation as int) > 30
+    union all
+    select brazil_versionset_name as risk_name,aggregate_roll_up_to,metric_run_date,metric_snapshot,
+    metric_snapshot_number,metric_year,days_non_compliant,days_non_compliant_recommendation,brazil_action_type as action_type
+     from rawdata_schema.sas_brazil_metrics where metric_run_date = 
+    (select max(metric_run_date) from rawdata_schema.sas_brazil_metrics) and aggregate_roll_up_to in ('{1}')  and 
+        cast(days_non_compliant_recommendation as int) > 30)
+    group by aggregate_roll_up_to,metric_run_date,metric_snapshot,aggregate_roll_up_to,metric_year,metric_snapshot_number)
+    """
+
+    '''
+    Insert query to copy retrieve data from parent table to new table with Max(rundate)
+    for Manual update of OE Risks by SE/Dev in Arik portal project.
+
+    Master ticket - https://issues.amazon.com/issues/AEESE-3612
+    '''
+
+    sas_temp_apollo_insert_query = """
+    INSERT INTO rawdata_schema.sas_apollo_metrics_v2 (apollo_environment_name, apollo_environment_stage, pipeline_id,
+    pipeline_name, owner, owner_login, consumers, children, software_count, visibility, host_count, days_non_compliant,
+    days_non_compliant_recommendation, apollo_action, blocked_resources, associated_campaigns, metric_run_date, metric_year,
+    classification, metric_snapshot, metric_snapshot_number, aggregate_roll_up_to) 
+    SELECT apollo_environment_name, apollo_environment_stage, pipeline_id, pipeline_name, owner, owner_login, consumers,
+    children, software_count, visibility, host_count, days_non_compliant, days_non_compliant_recommendation, apollo_action,
+    blocked_resources, associated_campaigns, metric_run_date, metric_year, classification, metric_snapshot, metric_snapshot_number,
+    aggregate_roll_up_to FROM rawdata_schema.sas_apollo_metrics
+    WHERE metric_run_date = (SELECT MAX(metric_run_date) FROM rawdata_schema.sas_apollo_metrics)
+    """
+
+    sas_temp_brazil_insert_query = """
+    INSERT INTO rawdata_schema.sas_brazil_metrics_v2 (brazil_versionset_name, pipeline_id, pipeline_name, owner, owner_login,
+    software_count, days_non_compliant, days_non_compliant_recommendation, blocked_resource, brazil_action_type, associated_campaigns,
+    metric_run_date, metric_year, classification, metric_snapshot, metric_snapshot_number, aggregate_roll_up_to) 
+    SELECT brazil_versionset_name, pipeline_id, pipeline_name, owner, owner_login, software_count, days_non_compliant,
+    days_non_compliant_recommendation, blocked_resource, brazil_action_type, associated_campaigns, metric_run_date, metric_year,
+    classification, metric_snapshot, metric_snapshot_number, aggregate_roll_up_to FROM rawdata_schema.sas_brazil_metrics
+    WHERE metric_run_date = (SELECT MAX(metric_run_date) FROM rawdata_schema.sas_brazil_metrics)
+    """
+
+    sas_temp_pipeline_target_insert_query = """
+    INSERT INTO rawdata_schema.sas_pipeline_target_metrics_v2 (pipeline_target_name, pipeline_id, pipeline_name, owner, owner_login,
+    software_count, days_non_compliant, days_non_compliant_recommendation, blocked_resource, pipeline_target_action_type, associated_campaigns,
+    metric_run_date, metric_year, classification, metric_snapshot, metric_snapshot_number, aggregate_roll_up_to) 
+    SELECT pipeline_target_name, pipeline_id, pipeline_name, owner, owner_login, software_count, days_non_compliant,
+    days_non_compliant_recommendation, blocked_resource, pipeline_target_action_type, associated_campaigns, metric_run_date, metric_year,
+    classification, metric_snapshot, metric_snapshot_number, aggregate_roll_up_to FROM rawdata_schema.sas_pipeline_target_metrics
+    WHERE metric_run_date = (SELECT MAX(metric_run_date) FROM rawdata_schema.sas_pipeline_target_metrics)
+    """
+
+———————————————————————————————————
+This document is about an issue with a dashboard called "Page 0" that shows various metrics for managers at Amazon. Specifically, there's a problem with something called the "SAS Plugin" (Software Analysis Service Plugin) that tracks software risks.
+Here's the situation:
+1. The dashboard is supposed to show how many "SAS risks" managers have in their area of responsibility
+2. Currently, most managers are seeing "0" risks in their scorecard, even though they actually have some risks marked as "Blocked"
+3. The main discussion is about what exactly should be shown in the scorecard:
+    * Should it show only the "Blocked" SAS risks that have recommendations (specific actions that can be taken to fix them)?
+    * Or should it show all "Blocked" SAS risks, even those without recommendations?
+The team is also discussing a transition to something called "IST Page-0" starting in 2025, and they need to figure out whether these SAS risk metrics should be included in the new system.
+Think of it like a car dashboard - right now, it's only showing problems that have clear solutions, but there's a debate about whether it should also show problems that need more investigation to fix.
+This is important because managers use this dashboard to track and address software risks in their areas of responsibility, and having accurate data helps them prioritize and address these risks effectively.
+
+
+
+
+How could this issue be resolved? The response shall consider all current or past uploaded documents.
+ 
+ 
+ 
+ 
+
+Based on the documents, there are several ways to resolve this issue:
+1. Clarify Metrics Definition and Implementation:
+* Define whether to show all blocked SAS risks or only those with recommendations in the scorecard
+* Current implementation shows only risks with recommendations, but this could be modified based on team decisions
+1. Follow the Suggested Next Steps from Leadership:
+* Check with Preetha/Sanjay if IST teams are aligned to track SAS risks
+* If yes: Schedule a meeting to discuss implementation in both IST and Page-0
+* If no: Have an internal meeting to determine how to have additional metrics for AEE
+1. Implement New Severity-Based Tracking:
+* Focus on top 3 severity levels: Emergent, Critical, and High (similar to PE risks)
+* Track actionable risks (those with recommended fixes available)
+* This aligns with the new SAS team's approach shown in their quicksight dashboard
+1. Documentation Update:
+* Update the scorecard definition to clearly state what is being measured
+* Ensure alignment with service owner expectations regarding risk resolution requirements
+1. Consider Short-term vs Long-term Solutions:
+* Short-term: Clarify current metrics and expectations
+* Long-term: Plan for transition to IST Page-0 in 2025 and determine how SAS metrics should be incorporated
+The team should decide based on whether service owners are expected to resolve risks without recommendations, as adding these to the Page-0 scorecard could create noise without actionable items.
+
+
+
+
+How to implement the New Severity-Based Tracking? Is there a RAGS API that can be utilized? The response shall consider all current or past uploaded documents.
+
+Based on the documents, here's how to implement the New Severity-Based Tracking using RAGS API:
+1. Use the GetResourceHighLevelRiskDetailsByCampaignType API: This API returns risk details including severity levels. The response includes:
+json
+"riskSeverityMapWithRecommendations": {
+    "High": 8,
+    "Low": 13,
+    "Medium": 0,
+    "Critical": 0
+}
+1. Implementation Steps:
+* Make API call with campaignType "BLOCKED" to get blocked software risks
+* Focus on tracking Emergent, Critical, and High severity risks
+* Filter for risks that have recommendations available (actionable risks)
+* Track the recommendation age for SLA purposes
+1. Example API Call:
+json
+{
+    "campaignType": "BLOCKED",
+    "aggregateId": "Person:managerLogin"
+}
+1. Processing Logic:
+* Only count risks with recommendations for actionable metrics
+* Track severity levels separately to focus on high-priority items
+* Monitor recommendation age to track overdue items (>90 days)
+* Roll up metrics to manager level using the aggregate_roll_upto queries
+The RAGS API provides all necessary data points to implement this new severity-based tracking system, allowing for better prioritization and tracking of critical software risks while maintaining focus on actionable items.
+
+
+
+
+How could this implementation be done in SAS plugin? The response shall consider all current or past uploaded documents.
+
+Based on the documents, here's how to implement the severity-based tracking in the SAS plugin:
+1. Modify the SAS_Plugin.py:
+* Update the call_get_high_level_resource_details method to include severity information when making API calls to RAGS
+* Add severity tracking in the data processing methods like get_apollo_data_and_write_in_file, get_brazil_data_and_write_in_file, and get_pipeline_target_data_and_write_in_file
+1. Update Redshift Tables: Add severity columns to the following tables:
+rawdata_schema.raw_sas_apollo_metrics
+rawdata_schema.raw_sas_brazil_metrics
+rawdata_schema.sas_apollo_metrics
+rawdata_schema.sas_brazil_metrics
+aggregate_schema.sas_risk_summary
+1. Modify Roll-up Queries: Update the roll-up queries in SAS_Config.py to include severity aggregation:
+* Update aggregate_roll_upto_total_query
+* Update aggregate_roll_upto_recommendation_query
+* Update aggregate_roll_upto_long_recommendation_query
+1. Add New Metrics: In the create_metrics method:
+* Track Emergent, Critical, and High severity risks separately
+* Only include risks with recommendations (days_non_compliant_recommendation > 0)
+* Calculate metrics based on severity levels
+1. Update Refresh Logic: Modify both weekly and monthly refresh jobs:
+Weekly Refresh: SAS_Metric_Refresh
+Monthly Refresh: SAS_Metric_Refresh_Monthly
+The implementation should maintain the existing plugin structure while adding the new severity-based tracking functionality through the RAGS API integration.
+
+
+
+
+Show me the implementation in SAS-pluign and config: The response shall consider all current or past uploaded documents.
+
+Based on the documents, here's the implementation code for both SAS plugin and config files:
+In SAS_config.py:
+python
+# Add new severity-based configuration
+class SAS_Config:
+    # ... existing configs ...
+
+    # Add severity tracking query
+    aggregate_roll_upto_severity_query = """
+    insert into {0} (
+    select count(risk_name) as risk_count,aggregate_roll_up_to,metric_run_date,
+    metric_snapshot,metric_snapshot_number,'{1}' as aggregate_rolled_upto,
+    metric_year,classification,severity_level 
+    from (
+    select apollo_environment_name as risk_name,aggregate_roll_up_to,
+    metric_run_date,metric_snapshot,metric_snapshot_number,metric_year,
+    days_non_compliant,days_non_compliant_recommendation,
+    apollo_action as action_type,severity_level
+    from rawdata_schema.sas_apollo_metrics where metric_run_date = 
+    (select max(metric_run_date) from rawdata_schema.sas_apollo_metrics) 
+    and cast(days_non_compliant_recommendation as int) > 0
+    and severity_level in ('Emergent', 'Critical', 'High')
+    union all
+    select brazil_versionset_name as risk_name,aggregate_roll_up_to,
+    metric_run_date,metric_snapshot,metric_snapshot_number,metric_year,
+    days_non_compliant,days_non_compliant_recommendation,
+    brazil_action_type as action_type,severity_level
+    from rawdata_schema.sas_brazil_metrics where metric_run_date = 
+    (select max(metric_run_date) from rawdata_schema.sas_brazil_metrics)
+    and cast(days_non_compliant_recommendation as int) > 0
+    and severity_level in ('Emergent', 'Critical', 'High'))
+    group by aggregate_roll_up_to,metric_run_date,metric_snapshot,
+    aggregate_rolled_upto,metric_year,classification,severity_level)
+    """
+In SAS_plugin.py:
+python
+class SAS_Plugin:
+    def get_apollo_data_and_write_in_file(self, data, file, metric_snapshot):
+        list_data = self.coral_to_python(data)
+        for filtered_depth_data in list_data['Details']:
+            # ... existing code ...
+            
+            # Add severity tracking
+            risk_severity_map = filtered_depth_data.get('riskSeverityMapWithRecommendations', {})
+            
+            for software_risk in filtered_depth_data['SoftwareRisks']:
+                for risk_details in software_risk['SoftwareRiskDetails']:
+                    # ... existing code ...
+                    
+                    # Add severity level to output
+                    severity_level = self._determine_severity_level(risk_details)
+                    
+                    file.write("{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n".format(
+                        env_name, stage_name, pipeline_id, pipeline_name,
+                        owner, owner_login, consumer_count, children_count,
+                        risk_count, visibility, host_count, oldest_risk_age,
+                        oldest_recommendation_age, action_required,
+                        blocked_resources, associated_campaigns,
+                        current_date, curent_year, classification,
+                        metric_snapshot, snapshot_number, severity_level))
+
+    def _determine_severity_level(self, risk_details):
+        # Logic to determine severity level based on risk details
+        if risk_details.get('isEmergent'):
+            return 'Emergent'
+        elif risk_details.get('isCritical'):
+            return 'Critical'
+        elif risk_details.get('isHigh'):
+            return 'High'
+        return 'Low'
+
+    def aggregate_metrics(self, distinct_managers):
+        for manager in distinct_managers:
+            # ... existing aggregation code ...
+            
+            # Add severity-based aggregation
+            insert_severity_result = self.rs_upsert.execute_redshift_sql_query(
+                SAS_Config.aggregate_roll_upto_severity_query.format(
+                    SAS_Config.sas_aggregate_table, manager))
+            
+            Logger.printLogs("[DEBUG]", 
+                "Severity Metrics rolled up to {} manager query result {}".format(
+                    manager, insert_severity_result))
+This implementation:
+1. Adds severity tracking to the data collection
+2. Modifies the data storage to include severity levels
+3. Updates aggregation queries to track risks by severity
+4. Only includes risks that have recommendations (days_non_compliant_recommendation > 0)
+5. Focuses on Emergent, Critical, and High severity risks
+The implementation maintains backward compatibility while adding the new severity-based tracking functionality.
+
+
+————————————————————————————————————
+Based on the uploaded documents and RAGS API documentation, here are 3 different approaches for implementing risk categorization:
+Approach 1: Direct RAGS API Integration
+python
+def get_severity_based_risks(self, aggregate_id):
+    # Use GetResourceHighLevelRiskDetailsByCampaignType API
+    high_level_data = self.client.get_resource_high_level_risk_details_by_campaign_type(
+        aggregate_id=aggregate_id,
+        campaign_type="BLOCKED"
+    )
+    
+    # Process built-in severity mapping
+    severity_counts = {
+        "EMERGENCY": high_level_data.riskSeverityMapWithRecommendations.get("Critical", 0),
+        "CRITICAL": high_level_data.riskSeverityMapWithRecommendations.get("High", 0),
+        "HIGH": high_level_data.riskSeverityMapWithRecommendations.get("Medium", 0)
+    }
+    
+    return severity_counts
+
+def update_redshift_data(self):
+    # Update Redshift schema to include severity
+    alter_table_query = """
+        ALTER TABLE {} ADD COLUMN severity VARCHAR(20)
+        CHECK (severity IN ('EMERGENCY', 'CRITICAL', 'HIGH'))
+    """
+Advantages:
+* Uses built-in RAGS severity classification
+* Minimal code changes required
+* Direct integration with existing API
+* Maintains data consistency
+Disadvantages:
+* Limited customization options
+* Dependent on RAGS API availability
+Approach 2: Custom Severity Classification
+python
+def classify_risk_severity(self, risk_data):
+    # Custom classification logic
+    def get_severity(risk_age, recommendation_age, risk_count):
+        if risk_age > 30 or recommendation_age > 20:
+            return "EMERGENCY"
+        elif risk_age > 20 or risk_count > 5:
+            return "CRITICAL"
+        return "HIGH"
+    
+    # Process each resource type
+    for resource_type in ["APOLLO", "BRAZIL", "PIPELINE_TARGET"]:
+        resource_data = self.get_resource_details(resource_type)
+        for risk in resource_data:
+            severity = get_severity(
+                risk.riskAge,
+                risk.recommendationAge,
+                risk.riskCount
+            )
+            self.update_risk_severity(risk.id, severity)
+Advantages:
+* Fully customizable classification logic
+* Independent of RAGS API changes
+* Can incorporate multiple data points
+Disadvantages:
+* More complex maintenance
+* Potential inconsistency with RAGS classification
+* Higher processing overhead
+Approach 3: Hybrid Aggregation
+python
+def aggregate_risk_severity(self, manager):
+    # Get data from multiple sources
+    high_level_data = self.get_high_level_risk_details(manager)
+    batch_summary = self.get_batch_risk_summary(manager)
+    historical_data = self.get_weekly_risk_summary(manager)
+    
+    # Combine metrics for classification
+    def calculate_severity(metrics):
+        if (metrics.riskAge > 30 or 
+            metrics.weekOverWeek > 0 or 
+            metrics.riskSeverity == "Critical"):
+            return "EMERGENCY"
+        elif (metrics.riskAge > 20 or 
+              metrics.monthOverMonth > 0 or 
+              metrics.riskSeverity == "High"):
+            return "CRITICAL"
+        return "HIGH"
+    
+    # Process and store results
+    severity_distribution = defaultdict(int)
+    for resource in high_level_data:
+        severity = calculate_severity(resource)
+        severity_distribution[severity] += 1
+        
+    return severity_distribution
+Advantages:
+* Combines multiple data sources
+* Balances RAGS and custom classification
+* Provides richer context for severity
+Disadvantages:
+* Most complex implementation
+* Higher API usage
+* More resource intensive
+Recommended Approach: Approach 1 (Direct RAGS API Integration)
+Reasons for recommendation:
+1. RAGS API already provides built-in severity classification
+2. Minimal implementation complexity
+3. Maintains consistency with Amazon's existing risk classification
+4. Lower maintenance overhead
+5. Better performance due to fewer API calls
+6. Already integrated with existing SAS infrastructure
+7. Supports batch processing for scale
+8. Provides standardized severity levels across teams
+______________________________________________________
+
+What are the throttling limits?
+
+1 TPS per API per AWS account
+Read API examples
+
+BatchGetAWSLambdaFunctionDetails
+
+NOTE: AWS Lamdba Function APIs are deprecated. Please use BatchGetPipelineTargetResourceDetails.
+The API batch size limit is 100
+Get details for the given list of AWSLambdaFunction entity Ids in the format: [awsAccountId]:[region]:[functionName]
+Required input:
+* entityIdList: A list of AWS Lambda function name; (Max entityIdList size we can support is 200)
+* requesterLogin: requester login (usually use the same supervisor login in allowlisting SIM);
+Optional input:
+* campaignType: BLOCK/NON_ADVISORY/ADVISORY/ALL;
+    * BLOCK -- all blocked software campaigns;
+    * NON_ADVISORY -- all campaigns on the default landing page (including all BLOCK campaigns);
+    * ADVISORY -- all campaigns on the Advisory Insights tab;
+    * ALL -- all campaigns;
+* campaignId: campaign id, for example "00000000-0000-0000-0000-000000000000" for "Blocked Software Campaign - Dec 2018";
+Note: if campaignType and campaignId are both null,  it will return risk details associsted with all campaigns; If campaignId is not null, it will return risk details only associated with the given campaign id; If campaignType is not null and campaignId is null, it will return risk details only associated with the given campaign type;
+Note: It will return empty list if given entity ids don't have any risk associsted with given campaign id or campaign type;
+Example Input:
+{
+  "entityIdList": [
+    "6541234564:us-west-2:SomeLambdaFunctionName-12M4HB61C83TE"
+  ],
+  "requesterLogin": "login"
+}
+Example Output:
+{
+  "details": [
+    {
+      "account": {
+        "accountId": "6541234564",
+        "org": "AWS"
+      },
+      "associatedVersions": [
+        "6541234564:us-west-2:SomeLambdaFunctionName-12M4HB61C83TE:99",
+        "6541234564:us-west-2:SomeLambdaFunctionName-12M4HB61C83TE:95",
+        "6541234564:us-west-2:SomeLambdaFunctionName-12M4HB61C83TE:96"
+      ],
+      "name": "6541234564:us-west-2:SomeLambdaFunctionName-12M4HB61C83TE",
+      "owner": "Owner Name",
+      "ownerLogin": "ownerLogin",
+      "pipelineId": "12345",
+      "pipelineName": "SomePipelineName"
+    }
+  ]
+}
+BatchGetAWSLambdaFunctionVersionDetails
+
+NOTE: AWS Lamdba Function APIs are deprecated. Please use BatchGetPipelineTargetResourceDetails.
+The API batch size limit is 100
+Get version details for the given list of AWSLambdaFunction entity Ids in the format: [awsAccountId]:[region]:[functionName]:[functionVersion]
+Required input:
+* entityIdList: A list of AWS Lambda function version name; (Max size we can support is 200)
+* requesterLogin: requester login (usually use the same supervisor login in allowlisting SIM);
+Optional input:
+* campaignType: BLOCK/NON_ADVISORY/ADVISORY/ALL;
+    * BLOCK -- all blocked software campaigns;
+    * NON_ADVISORY -- all campaigns on the default landing page (including all BLOCK campaigns);
+    * ADVISORY -- all campaigns on the Advisory Insights tab;
+    * ALL -- all campaigns;
+* campaignId: campaign id, for example "00000000-0000-0000-0000-000000000000" for "Blocked Software Campaign - Dec 2018";
+Note: if campaignType and campaignId are both null,  it will return risk details associsted with all campaigns; If campaignId is not null, it will return risk details only associated with the given campaign id; If campaignType is not null and campaignId is null, it will return risk details only associated with the given campaign type;
+Note: It will return empty list if given entity ids don't have any risk associsted with given campaign id or campaign type;
+Example Input:
+{
+  "entityIdList": [
+    "6541234564:us-west-2:SomeLambdaFunctionName-12M4HB61C83TE:99"
+  ],
+  "requesterLogin": "login"
+}
+Example Output:
+{
+  "details": [
+    {
+      "account": {
+        "accountId": "6541234564",
+        "org": "AWS"
+      },
+      "name": "6541234564:us-west-2:SomeLambdaFunctionName-12M4HB61C83TE:99",
+      "oldestRiskAge": 65,
+      "owner": "Owner Name",
+      "ownerLogin": "ownerName",
+      "pipelineId": "12345",
+      "pipelineName": "SomePipelineName",
+      "riskCount": 3,
+      "softwareRisks": [
+        {
+          "associatedCampaign": {
+            "contact": "NA",
+            "name": "OdinAWSCredential - Dry run campaign",
+            "url": "NA"
+          },
+          "softwareRiskDetails": [
+            {
+              "riskAge": 63,
+              "targetResource": "OdinAWSCredentials:1.4"
+            }
+          ]
+        },
+        {
+          "associatedCampaign": {
+            "contact": "contactInfo",
+            "name": "campaignName",
+            "url": "url about the campaign"
+          },
+          "softwareRiskDetails": [
+            {
+              "riskAge": 63,
+              "targetResource": "RiskyPackage:1.0"
+            },
+            {
+              "riskAge": 63,
+              "targetResource": "RiskyPackage2:1.1"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
+BatchGetApolloEnvironmentStageDetails
+
+The API batch size limit is 100
+Get environment details for the given Apollo environment stage entityIds in format: [EnvironmentName]:[Stage]
+Required input:
+* entityIdList: A list of apollo environment stage name; (Max size we can support is 200)
+* requesterLogin: requester login (usually use the same supervisor login in allowlisting SIM);
+Optional input:
+* campaignType: BLOCK/NON_ADVISORY/ADVISORY/ALL;
+    * BLOCK -- all blocked software campaigns;
+    * NON_ADVISORY -- all campaigns on the default landing page (including all BLOCK campaigns);
+    * ADVISORY -- all campaigns on the Advisory Insights tab;
+    * ALL -- all campaigns;
+* campaignId: campaign id, for example "00000000-0000-0000-0000-000000000000" for "Blocked Software Campaign - Dec 2018";
+Note: if campaignType and campaignId are both null,  it will return risk details associsted with all campaigns; If campaignId is not null, it will return risk details only associated with the given campaign id; If campaignType is not null and campaignId is null, it will return risk details only associated with the given campaign type;
+Note: It will return empty list if given entity ids don't have any risk associsted with given campaign id or campaign type;
+Example input:
+{
+  "entityIdList": [
+    "ApolloEnvironmentName:Prod"
+  ],
+  "requesterLogin": "wyep"
+}
+Example Output:
+{
+  "details": [
+    {
+      "childrenCount": 0,
+      "consumerCount": 0,
+      "hostCount": 2,
+      "name": "ApolloEnvironmentName:Prod",
+      "oldestRiskAge": 117,
+      "owner": "Owner name",
+      "ownerLogin": "ownerLogin",
+      "pipelineId": "12345",
+      "pipelineName": "SomePipelineName",
+      "recommendations": [
+        {
+          "associatedTargetResources": [
+            "CoralRubyClientBuildLogic:1.0",
+            "CoralTibcoValue:1.0",
+            "CoralTransmutingProxy:1.0",
+            "CoralBatchingSupport:1.0",
+          ],
+          "details": "{\"entity\":\"ApolloEnvironmentName:Prod\"}",
+          "template": "APOLLO_NO_ACTION"
+        },
+        {
+          "associatedTargetResources": [
+            "Jackson-databind:2.8.x"
+          ],
+          "details": "{\"consumableEnvironmentsToUpdate\":[\"SomeConsumableEnvironmentName:Prod:105326079224\"],\"entity\":\"ApolloEnvironmentName:Prod\"}",
+          "template": "APOLLO_CAN_UPDATE"
+        }
+      ],
+      "riskCount": 1,
+      "softwareRisks": [
+        {
+          "associatedCampaign": {
+            "contact": "https://sim.amazon.com/issues/create?assignedFolder=dfio1291-5fcc-47fd-8089-eeb19123f46f",
+            "name": "CDO Blocked Software Campaign",
+            "url": "https://w.amazon.com/index.php/somepages"
+          },
+          "softwareRiskDetails": [
+            {
+              "consumers": [
+                "ApolloEnvironmentStageRevision:SomeConsumableEnvironmentName:Prod:105326079224"
+              ],
+              "recommendationAge": 27,
+              "riskAge": 117,
+              "targetResource": "Jackson-databind:2.8.x"
+            }
+          ]
+        }
+      ],
+      "visibility": "Internal"
+    }
+  ]
+}
+BatchGetBrazilVersionSetDetails
+
+The API batch size limit is 100
+Required input:
+* entityIdList: A list of Brazil version set name; (Max size we can support is 200)
+* requesterLogin: requester login (usually use the same supervisor login in allowlisting SIM);
+Optional input:
+* campaignType: BLOCK/NON_ADVISORY/ADVISORY/ALL;
+    * BLOCK -- all blocked software campaigns;
+    * NON_ADVISORY -- all campaigns on the default landing page (including all BLOCK campaigns);
+    * ADVISORY -- all campaigns on the Advisory Insights tab;
+    * ALL -- all campaigns;
+* campaignId: campaign id, for example "00000000-0000-0000-0000-000000000000" for "Blocked Software Campaign - Dec 2018";
+Note: if campaignType and campaignId are both null,  it will return risk details associsted with all campaigns; If campaignId is not null, it will return risk details only associated with the given campaign id; If campaignType is not null and campaignId is null, it will return risk details only associated with the given campaign type;
+Note: It will return empty list if given entity ids don't have any risk associsted with given campaign id or campaign type;
+Example input:
+{
+  "entityIdList": [
+    "SomeBrazilVersionSet/development"
+  ],
+  "requesterLogin": "wyep"
+}
+Example Output:
+{
+  "details": [
+    {
+      "name": "SomeBrazilVersionSet/development",
+      "oldestRiskAge": 56,
+      "owner": "Owenr Name",
+      "ownerLogin": "ownerLogin",
+      "recommendations": [
+        {
+          "actions": [],
+          "brazilActionCount": 0,
+          "hasFullActions": false,
+          "targetResource": "CoralJavaBuildLogic:1.0"
+        },
+        {
+          "actions": [],
+          "brazilActionCount": 0,
+          "hasFullActions": false,
+          "targetResource": "Jackson-databind:2.8.x"
+        }
+      ],
+      "riskCount": 1,
+      "softwareRisks": [
+        {
+          "associatedCampaign": {
+            "contact": "https://sim.amazon.com/issues/create?assignedFolder=ddba1fg1-5fcc-47fd-12389-eeb19sdfc46f",
+            "name": "CDO Blocked Software Campaign",
+            "url": "https://w.amazon.com/index.php/somePage"
+          },
+          "softwareRiskDetails": [
+            {
+              "dependencies": [],
+              "riskAge": 56,
+              "targetResource": "Jackson-databind:2.8.x"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
+BatchGetPipelineTargetResourceDetails
+
+The API batch size limit is 100
+Required input:
+* entityIdList: A list of Amazon Pipeline Target name; (Max size we can support is 200)
+* requesterLogin: requester login (usually use the same supervisor login in allowlisting SIM);
+Optional input:
+* campaignType: BLOCK/NON_ADVISORY/ADVISORY/ALL;
+    * BLOCK -- all blocked software campaigns;
+    * NON_ADVISORY -- all campaigns on the default landing page (including all BLOCK campaigns);
+    * ADVISORY -- all campaigns on the Advisory Insights tab;
+    * ALL -- all campaigns;
+* campaignId: campaign id, for example "00000000-0000-0000-0000-000000000000" for "Blocked Software Campaign - Dec 2018";
+Note: if campaignType and campaignId are both null,  it will return risk details associsted with all campaigns; If campaignId is not null, it will return risk details only associated with the given campaign id; If campaignType is not null and campaignId is null, it will return risk details only associated with the given campaign type;
+Note: It will return empty list if given entity ids don't have any risk associsted with given campaign id or campaign type;
+Example input:
+{
+  "entityIdList": [
+    "us-west-2:4099375:alphaApplication:DG"
+  ],
+  "requesterLogin": "wyep"
+}
+Example Output:
+{ "details": [ 
+  { 
+    "name": "us-west-2:4099375:alphaApplication:DG", 
+    "pipelineId" : 4099375, 
+    "pipelineName" : "SomePipelineName", 
+    "pipelineTargetType" : "DeploymentGroup", 
+    "pipelineStage" : "alpha",
+    "oldestRiskAge": 56, 
+    "owner": "Owner Name", 
+    "ownerLogin": "ownerLogin",  
+    "riskCount": 1, 
+    "softwareRisks": [
+      { 
+        "associatedCampaign": 
+          { 
+            "contact": "https://sim.amazon.com/issues/create?assignedFolder=ddba1fg1-5fcc-47fd-12389-eeb19sdfc46f", 
+            "name": "CDO Blocked Software Campaign", 
+            "url": "https://w.amazon.com/index.php/somePage" 
+          }, 
+        "softwareRiskDetails": [ 
+          { 
+            "dependencies": [], 
+            "riskAge": 56, 
+            "targetResource": "Jackson-databind:2.8.x" 
+          } 
+        ] 
+      } 
+    ] 
+  } 
+] }
+BatchGetCodeDeployDeploymentGroupNameDetails
+
+NOTE: CodeDeployDeploymentGroup APIs are deprecated. Please use BatchGetPipelineTargetResourceDetails.
+The API batch size limit is 100
+Get CodeDeployDeploymentGroup details for given entityIdList. entityId format:  [AccountId]:[Region]:[ApplicationName]:[DeploymentGroupName]
+Required input:
+* entityIdList: A list of AWS CodeDeploy deployment group name;
+* requesterLogin: requester login (usually use the same supervisor login in allowlisting SIM);
+Optional input:
+* campaignType: BLOCK/NON_ADVISORY/ADVISORY/ALL;
+    * BLOCK -- all blocked software campaigns;
+    * NON_ADVISORY -- all campaigns on the default landing page (including all BLOCK campaigns);
+    * ADVISORY -- all campaigns on the Advisory Insights tab;
+    * ALL -- all campaigns;
+* campaignId: campaign id, for example "00000000-0000-0000-0000-000000000000" for "Blocked Software Campaign - Dec 2018";
+Note: if campaignType and campaignId are both null,  it will return risk details associsted with all campaigns; If campaignId is not null, it will return risk details only associated with the given campaign id; If campaignType is not null and campaignId is null, it will return risk details only associated with the given campaign type;
+Note: It will return empty list if given entity ids don't have any risk associsted with given campaign id or campaign type;
+Example Input:
+{
+  "entityIdList": [
+    "9243453641545:us-west-2:SomeCodeDeployService-m-CodeDeployApp-3GBSCNEYM3GO0:SomeCodeDeployService-m-DeploymentGroup1-1440FEBIOJK7GE"
+  ],
+  "requesterLogin": "wyep"
+} 
+Example Output:
+{
+  "details": [
+    {
+      "account": {
+        "accountId": "9243453641545",
+        "org": "AWS"
+      },
+      "name": "9243453641545:ca-central-1:SomeCodeDeployService-m-CodeDeployApp-3ZSCNEYM3HO0:SomeCodeDeployService-m-DeploymentGroup1-1440FEBJKB7GE",
+      "oldestRiskAge": 75,
+      "owner": "OwnerName",
+      "ownerLogin": "ownerlogin",
+      "riskCount": 2,
+      "softwareRisks": [
+        {
+          "associatedCampaign": {
+            "contact": "https://issues.amazon.com/issues/create?assignedFolder=b867b140-a87d-1234-9d40-408195ebf5a6",
+            "name": "Load Test Campaign Coral 1.0 Deprecation",
+            "url": "https://w.amazon.com/index.php/somePage"
+          },
+          "softwareRiskDetails": [
+            {
+              "riskAge": 64,
+              "targetResource": "Bobcat:2.1"
+            },
+            {
+              "riskAge": 64,
+              "targetResource": "CoralActivity:1.0"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+} 
+BatchGetDownstreamAggregatesWithRiskByCampaignType
+
+For a given aggregateId, campaign type, get list of direct downstream aggregates whose total risk count is non-zero. AggregateId format: Person:[login]
+Campaign Type could be: NON_ADVISORY (all campaigns on SAS Dashboard landing page, including BLOCKED campaigns), ADVISORY(all campaigns on SAS Dashboard Advisory page), BLOCKED (https://w.amazon.com/index.php/BuilderTools/SoftwareAssurance/BlockedSoftwareCampaign)
+Example Input:
+{
+  "aggregateId": "Person:someLogin",
+  "campaignType": "NON_ADVISORY"
+} 
+Example Output:
+{
+  "downstreamAggregateIdList": [
+    "Person:employeeLoginA",
+    "Person:employeeLoginB",
+    "Person:employeeLoginC"
+  ]
+} 
+BatchGetDownstreamAggregatesWithRiskByCampaignIds
+
+For a given aggregateId, list of campaignIds, get list of direct downstream aggregates whose total risk count is non-zero. AggregateId format: Person:[login]
+Example Input:
+{
+  "aggregateId": "Person:someLogin",
+  "campaignIds": ["00000000-0000-0000-0000-000000000000"]
+} 
+Example Output:
+{
+  "downstreamAggregateIdList": [
+    "Person:employeeLoginA",
+    "Person:employeeLoginB",
+    "Person:employeeLoginC"
+  ]
+} 
+BatchGetElasticContainerServiceDetails
+
+NOTE: ECS APIs are deprecated, please switch to using BatchGetPipelineTargetResourceDetails
+Get Elastic Container Service Details for a list of Elastic Container Service entity. entityId format: [AccountId]:[Region]:[Cluster]:[TaskId]
+Required input:
+* entityIdList: A list of AWS elastic container service name;
+* requesterLogin: requester login (usually use the same supervisor login in allowlisting SIM);
+Optional input:
+* campaignType: BLOCK/NON_ADVISORY/ADVISORY/ALL;
+    * BLOCK -- all blocked software campaigns;
+    * NON_ADVISORY -- all campaigns on the default landing page (including all BLOCK campaigns);
+    * ADVISORY -- all campaigns on the Advisory Insights tab;
+    * ALL -- all campaigns;
+* campaignId: campaign id, for example "00000000-0000-0000-0000-000000000000" for "Blocked Software Campaign - Dec 2018";
+Note: if campaignType and campaignId are both null,  it will return risk details associsted with all campaigns; If campaignId is not null, it will return risk details only associated with the given campaign id; If campaignType is not null and campaignId is null, it will return risk details only associated with the given campaign type;
+Note: It will return empty list if given entity ids don't have any risk associsted with given campaign id or campaign type;
+Example Input:
+{
+  "entityIdList": [
+    "3153921211059:us-west-2:Cluster:4058b32371fb41c7b1d81b642bdff2ad"
+  ],
+  "requesterLogin": "wyep"
+} 
+Example Output:
+{
+  "details": [
+    {
+      "account": {
+        "accountId": "3153921211059",
+        "org": "AWS"
+      },
+      "name": "3153921211059:us-west-2:Cluster:4058b32371fb41c7b1d81b642bdff2ad",
+      "oldestRiskAge": 65,
+      "owner": "Owner Name",
+      "ownerLogin": "ownerName",
+      "pipelineId": "12345",
+      "pipelineName": "SomePipelineName",
+      "riskCount": 3,
+      "softwareRisks": [
+        {
+          "associatedCampaign": {
+            "contact": "NA",
+            "name": "OdinAWSCredential - Dry run campaign",
+            "url": "NA"
+          },
+          "softwareRiskDetails": [
+            {
+              "riskAge": 63,
+              "targetResource": "OdinAWSCredentials:1.4"
+            }
+          ]
+        },
+        {
+          "associatedCampaign": {
+            "contact": "contactInfo",
+            "name": "campaignName",
+            "url": "url about the campaign"
+          },
+          "softwareRiskDetails": [
+            {
+              "riskAge": 63,
+              "targetResource": "RiskyPackage:1.0"
+            },
+            {
+              "riskAge": 63,
+              "targetResource": "RiskyPackage2:1.1"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+} 
+BatchGetRiskSummaryCountByCampaignType
+
+For a given aggregateId and campaign type, get the summary of total risk count, total risk with recommendation, WoW, MoM and YTD risks for the given login and his/her direct reports
+Campaign Type could be: NON_ADVISORY (all campaigns on SAS Dashboard landing page, including BLOCKED campaigns), ADVISORY(all campaigns on SAS Dashboard Advisory page), BLOCKED (https://w.amazon.com/index.php/BuilderTools/SoftwareAssurance/BlockedSoftwareCampaign)
+Example Input:
+ {
+    "campaignType": "ADVISORY",
+    "aggregateId": "Person:aytul"
+} 
+Example output:
+ {
+    "owner": "aytul",
+    "ownerName": "AYTUL ARISOY",
+    "manager": "ramensky",
+    "managerName": "Peter Ramensky",
+    "totalCount": {
+        "APOLLO_ENVIRONMENT_NAME_AND_STAGE": {
+            "totalRiskCount": 10,
+            "totalRiskCountWithRecommendation": 8,
+            "weekOverWeek": -5,
+            "monthOverMonth": -10,
+            "yearToDate": -10
+        },
+        "BRAZIL_VERSION_SET": {
+            "totalRiskCount": 2,
+            "totalRiskCountWithRecommendation": 0,
+            "weekOverWeek": -3,
+            "monthOverMonth": -3,
+            "yearToDate": -3
+        }
+    },
+    "individualCountList": [
+        {
+            "ownerLogin": "aytul",
+            "ownerName": "AYTUL ARISOY",
+            "entityRiskCountMap": {
+                "APOLLO_ENVIRONMENT_NAME_AND_STAGE": {
+                    "totalRiskCount": 8,
+                    "totalRiskCountWithRecommendation": 6,
+                    "weekOverWeek": -4,
+                    "monthOverMonth": -9,
+                    "yearToDate": -9
+                },
+                "BRAZIL_VERSION_SET": {
+                    "totalRiskCount": 2,
+                    "totalRiskCountWithRecommendation": 0,
+                    "weekOverWeek": -3,
+                    "monthOverMonth": -3,
+                    "yearToDate": -3
+                }
+            }
+        },
+        {
+            "ownerLogin": "cheryl",
+            "ownerName": "Cheryl Chen",
+            "entityRiskCountMap": {
+                "APOLLO_ENVIRONMENT_NAME_AND_STAGE": {
+                    "totalRiskCount": 2,
+                    "totalRiskCountWithRecommendation": 2,
+                    "weekOverWeek": -1,
+                    "monthOverMonth": -1,
+                    "yearToDate": -1
+                }
+            }
+        }
+    ]
+} 
+BatchGetRiskSummaryCountByCampaignIds
+
+For a given aggregateId and list of campaign ids, get the summary of total risk count, total risk with recommendation, WoW, MoM and YTD risks for the given login and his/her direct reports
+Example Input:
+ {
+    "aggregateId": "Person:aytul"
+    "campaignIds": ["df7448de-02a0-4b1c-b836-03f39750cf4d"]
+} 
+Example output:
+ {
+    "ownerLogin": "aytul",
+    "ownerName": "AYTUL ARISOY",
+    "managerLogin": "ramensky",
+    "managerName": "Peter Ramensky",
+    "totalCount": {
+        "APOLLO_ENVIRONMENT_NAME_AND_STAGE": {
+            "totalRiskCount": 10,
+            "totalRiskCountWithRecommendation": 8,
+            "weekOverWeek": -5,
+            "monthOverMonth": -10,
+            "yearToDate": -10
+        },
+        "BRAZIL_VERSION_SET": {
+            "totalRiskCount": 2,
+            "totalRiskCountWithRecommendation": 0,
+            "weekOverWeek": -3,
+            "monthOverMonth": -3,
+            "yearToDate": -3
+        }
+    },
+    "individualCountList": [
+        {
+            "ownerLogin": "aytul",
+            "ownerName": "AYTUL ARISOY",
+            "entityRiskCountMap": {
+                "APOLLO_ENVIRONMENT_NAME_AND_STAGE": {
+                    "totalRiskCount": 8,
+                    "totalRiskCountWithRecommendation": 6,
+                    "weekOverWeek": -4,
+                    "monthOverMonth": -9,
+                    "yearToDate": -9
+                },
+                "BRAZIL_VERSION_SET": {
+                    "totalRiskCount": 2,
+                    "totalRiskCountWithRecommendation": 0,
+                    "weekOverWeek": -3,
+                    "monthOverMonth": -3,
+                    "yearToDate": -3
+                }
+            }
+        },
+        {
+            "ownerLogin": "cheryl",
+            "ownerName": "Cheryl Chen",
+            "entityRiskCountMap": {
+                "APOLLO_ENVIRONMENT_NAME_AND_STAGE": {
+                    "totalRiskCount": 2,
+                    "totalRiskCountWithRecommendation": 2,
+                    "weekOverWeek": -1,
+                    "monthOverMonth": -1,
+                    "yearToDate": -1
+                }
+            }
+        }
+    ]
+} 
+BatchGetWeeklyRiskSummaryCountByCampaignType
+
+For a given aggregateId, campaign type and week number (default 6 weeks), get the total risks of past weeks for the given login. AggregateId format: Person:[login]
+Campaign Type could be: NON_ADVISORY (all campaigns on SAS Dashboard landing page, including BLOCKED campaigns), ADVISORY(all campaigns on SAS Dashboard Advisory page), BLOCKED (https://w.amazon.com/index.php/BuilderTools/SoftwareAssurance/BlockedSoftwareCampaign)
+Example Input:
+{
+  "aggregateId": "Person:employeeA",
+  "campaignType": "ADVISORY",
+  "weekNumber": 3
+} 
+Example Output:
+{
+  "ownerLogin": "employeeA",
+  "ownerName": "employeeName",
+  "weeklyTotalCount": {
+    "BRAZIL_VERSION_SET": {
+      "2020-12-23": 271,
+      "2021-01-06": 241,
+      "2020-12-30": 246
+    },
+    "AMAZON_PIPELINE_TARGET": {
+      "2020-12-23": 2,
+      "2021-01-06": 2,
+      "2020-12-30": 4
+    },
+    "APOLLO_ENVIRONMENT_NAME_AND_STAGE": {
+      "2020-12-23": 816,
+      "2021-01-06": 792,
+      "2020-12-30": 820
+    }
+  }
+} 
+GetPipelineTargetResourceDetails
+
+Required input:
+* entityIdList: Amazon Pipeline Target name; (Max size we can support is 200)
+* requesterLogin: requester login (usually use the same supervisor login in allowlisting SIM);
+Optional input:
+* campaignType: BLOCK/NON_ADVISORY/ADVISORY/ALL;
+    * BLOCK -- all blocked software campaigns;
+    * NON_ADVISORY -- all campaigns on the default landing page (including all BLOCK campaigns);
+    * ADVISORY -- all campaigns on the Advisory Insights tab;
+    * ALL -- all campaigns;
+* campaignId: campaign id, for example "00000000-0000-0000-0000-000000000000" for "Blocked Software Campaign - Dec 2018";
+Note: if campaignType and campaignId are both null,  it will return risk details associsted with all campaigns; If campaignId is not null, it will return risk details only associated with the given campaign id; If campaignType is not null and campaignId is null, it will return risk details only associated with the given campaign type;
+Note: It will return empty list if given entity ids don't have any risk associsted with given campaign id or campaign type;
+Example input:
+{
+  "entityIdList": "us-west-2:4099375:alphaApplication:DG",
+  "requesterLogin": "wyep"
+}
+Example Output:
+  { 
+    "name": "us-west-2:4099375:alphaApplication:DG", 
+    "pipelineId" : 4099375, 
+    "pipelineName" : "SomePipelineName", 
+    "pipelineTargetType" : "DeploymentGroup", 
+    "pipelineStage" : "alpha",
+    "oldestRiskAge": 56, 
+    "owner": "Owner Name", 
+    "ownerLogin": "ownerLogin",  
+    "riskCount": 1, 
+    "softwareRisks": [
+      { 
+        "associatedCampaign": 
+          { 
+            "contact": "https://sim.amazon.com/issues/create?assignedFolder=ddba1fg1-5fcc-47fd-12389-eeb19sdfc46f", 
+            "name": "CDO Blocked Software Campaign", 
+            "url": "https://w.amazon.com/index.php/somePage" 
+          }, 
+        "softwareRiskDetails": [ 
+          { 
+            "dependencies": [], 
+            "riskAge": 56, 
+            "targetResource": "Jackson-databind:2.8.x" 
+          } 
+        ] 
+      } 
+    ] 
+  } 
+GetAWSLambdaFunctionDetails
+
+NOTE: AWS Lamdba Function APIs are deprecated. Please use GetPipelineTargetResourceDetails.
+Get AWS Lambda Function Details for given entityId in format: [AccountId]:[Region]:[FunctionName]
+Required input:
+* entityId: AWS Lambda function name;
+* requesterLogin: requester login (usually use the same supervisor login in allowlisting SIM);
+Optional input:
+* campaignType: BLOCK/NON_ADVISORY/ADVISORY/ALL;
+    * BLOCK -- all blocked software campaigns;
+    * NON_ADVISORY -- all campaigns on the default landing page (including all BLOCK campaigns);
+    * ADVISORY -- all campaigns on the Advisory Insights tab;
+    * ALL -- all campaigns;
+* campaignId: campaign id, for example "00000000-0000-0000-0000-000000000000" for "Blocked Software Campaign - Dec 2018";
+Note: if campaignType and campaignId are both null,  it will return risk details associsted with all campaigns; If campaignId is not null, it will return risk details only associated with the given campaign id; If campaignType is not null and campaignId is null, it will return risk details only associated with the given campaign type;
+Note: It will throw coral InvalidRequestException if given entity id doesn't have any risk associsted with given campaign id or campaign type;
+Example Input:
+{
+  "entityId": "0390295230123:us-west-1:AwsSomeServiceLambda-LambdaFunction-IXIJ4432PFBIO",
+  "requesterLogin": "wyep"
+} 
+Example Output:
+{
+  "account": {
+    "accountId": "0390295230123",
+    "org": "AWS"
+  },
+  "associatedVersions": [
+    "0390295230123:us-west-1:AwsSomeServiceLambda-LambdaFunction-IXIJ4432PFBIO:99",
+    "0390295230123:us-west-1:AwsSomeServiceLambda-LambdaFunction-IXIJ4432PFBIO:95",
+    "0390295230123:us-west-1:AwsSomeServiceLambda-LambdaFunction-IXIJ4432PFBIO:96",
+    "0390295230123:us-west-1:AwsSomeServiceLambda-LambdaFunction-IXIJ4432PFBIO:97",
+    "0390295230123:us-west-1:AwsSomeServiceLambda-LambdaFunction-IXIJ4432PFBIO:98"
+  ],
+  "name": "0390295230123:us-west-1:AwsSomeServiceLambda-LambdaFunction-IXIJ4432PFBIO",
+  "owner": "OwnerName",
+  "ownerLogin": "ownerLogin",
+  "pipelineId": "123145",
+  "pipelineName": "AwsSomeServiceLambda"
+} 
+GetAWSLambdaFunctionVersionDetails
+
+NOTE: AWSLamdbaFunction APIs are deprecated. Please use GetPipelineTargetResourceDetails.
+Get AWS Lambda Function Version Details for given entityId in format: [AccountId]:[Region]:[FunctionName]:[VersionNumber]
+Required input:
+* entityId: AWS Lambda function version name;
+* requesterLogin: requester login (usually use the same supervisor login in allowlisting SIM);
+Optional input:
+* campaignType: BLOCK/NON_ADVISORY/ADVISORY/ALL;
+    * BLOCK -- all blocked software campaigns;
+    * NON_ADVISORY -- all campaigns on the default landing page (including all BLOCK campaigns);
+    * ADVISORY -- all campaigns on the Advisory Insights tab;
+    * ALL -- all campaigns;
+* campaignId: campaign id, for example "00000000-0000-0000-0000-000000000000" for "Blocked Software Campaign - Dec 2018";
+Note: if campaignType and campaignId are both null,  it will return risk details associsted with all campaigns; If campaignId is not null, it will return risk details only associated with the given campaign id; If campaignType is not null and campaignId is null, it will return risk details only associated with the given campaign type;
+Note: It will throw coral InvalidRequestException if given entity id doesn't have any risk associsted with given campaign id or campaign type;
+Example Input:
+{
+  "entityId": "0390295230123:us-west-1:AwsSomeServiceLambda-LambdaFunction-IXIJ4432PFBIO:98",
+  "requesterLogin": "wyep"
+} 
+Example Output:
+{
+  "account": {
+    "accountId": "0390295230123",
+    "org": "AWS"
+  },
+  "name": "0390295230123:us-west-1:AwsSomeServiceLambda-LambdaFunction-IXIJ4432PFBIO:98",
+  "oldestRiskAge": 67,
+  "owner": "Owner Name",
+  "ownerLogin": "ownerlogin",
+  "pipelineId": "123455",
+  "pipelineName": "AwsSomeServiceLambda",
+  "riskCount": 1,
+  "softwareRisks": [
+    {
+      "associatedCampaign": {
+        "contact": "https://issues.amazon.com/issues/create?template=123124-4642-4a56-9c7d-81231236",
+        "name": "Security Jackson campaign",
+        "url": "https://w.amazon.com/index.php/somePage"
+      },
+      "softwareRiskDetails": [
+        {
+          "riskAge": 56,
+          "targetResource": "Jackson-dataformat-cbor:2.9.x"
+        }
+      ]
+    }
+  ]
+} 
+GetAllCampaignsOfAggregate
+
+This API get all campaigns which this employee and all employees finally reports to them have risks. Campaigns are divided by different campaign type: NON_ADVISORY, ADVISORY, BLOCKED and NON_TYPE;
+* CampaignType is defined here: https://code.amazon.com/packages/SASRiskAggregationServiceModel/blobs/c747bd3b68333554f75149dbbac790d89ea481b2/--/model/data-types.xml#L243
+* NO_TYPE should be usually null, it only has value when there is something wrong getting the campaign data;
+Example Input:
+ { "aggregateId": "Person:employeeLogin" } 
+Example Output:
+ {
+    "getAllCampaignsOfAggregateResponseMap": {
+        "NON_ADVISORY": [
+            {
+                "id": "912507f7-3d5e-4afe-a05c-2gi438aabe5e8",
+                "url": "https://w.amazon.com/somepage",
+                "name": "NSCampaign"
+
+            },
+            {
+                "id": "a523080a-5a08-4f13-b200-d49174ddt3250",
+                "url": "https://w.amazon.com/someotherPage",
+                "name": "PlatformTest2"
+            },
+            {
+                "id": "9291a12166-1462-48bc-af29-b31322512c5bb1",
+                "url": "https://w.amazon.com/anotherPage",
+                "name": "GGQSCampaign"
+            }
+        ],
+        "ADVISORY": [
+            {
+                "id": "22cd247b-9e30-4763-9bc5-e33578763e8d",
+                "url": "https://w.amazon.com/bin/view/SUSAdvisoryCampaign",
+                "name": "SUSAdvisoryCampaign"
+            }
+        ],
+        "BLOCKED": [
+            {
+                "id": "00000000-0000-0000-0000-000000000000",
+                "url": "https://w.amazon.com/bin/view/BLOCKEDCampaign",
+                "name": "Blocked Software Campaign - Dec 2018"
+            }
+        ]
+    }
+ } 
+GetApolloEnvironmentStageDetails
+
+Get Apollo environment stage details
+Required input:
+* entityId: Apollo environment stage name;
+* requesterLogin: requester login (usually use the same supervisor login in allowlisting SIM);
+Optional input:
+* campaignType: BLOCK/NON_ADVISORY/ADVISORY/ALL;
+    * BLOCK -- all blocked software campaigns;
+    * NON_ADVISORY -- all campaigns on the default landing page (including all BLOCK campaigns);
+    * ADVISORY -- all campaigns on the Advisory Insights tab;
+    * ALL -- all campaigns;
+* campaignId: campaign id, for example "00000000-0000-0000-0000-000000000000" for "Blocked Software Campaign - Dec 2018";
+Note: if campaignType and campaignId are both null,  it will return risk details associsted with all campaigns; If campaignId is not null, it will return risk details only associated with the given campaign id; If campaignType is not null and campaignId is null, it will return risk details only associated with the given campaign type;
+Note: It will throw coral InvalidRequestException if given entity id doesn't have any risk associsted with given campaign id or campaign type;
+Example input:
+{
+  "entityId": "SomeApolloEnvironment/IAD:Gamma",
+  "requesterLogin": "wyep"
+} 
+Example Output:
+{
+  "childrenCount": 1,
+  "consumerCount": 0,
+  "hostCount": 3,
+  "name": "SomeApolloEnvironment/IAD:Gamma",
+  "oldestRiskAge": 118,
+  "owner": "OwnerName",
+  "pipelineId": "203511",
+  "pipelineName": "pipelineName",
+  "recommendations": [
+    {
+      "associatedTargetResources": [
+        "CoralRubyClientBuildLogic:1.0",
+        "CoralTibcoValue:1.0",
+        "CoralTransmutingProxy:1.0"
+      ],
+      "details": "{\"entity\":\"SomeApolloEnvironment/IAD:Gamma\"}",
+      "template": "APOLLO_NO_ACTION"
+    }
+  ],
+  "riskCount": 61,
+  "softwareRisks": [
+    {
+      "associatedCampaign": {
+        "contact": "https://sim.amazon.com/issues/create?assignedFolder=ddb12314-5fcc-47fd-8089-eeb123123d46f",
+        "name": "CDO Blocked Software Campaign - Aug 2020 Gamma",
+        "url": "https://w.amazon.com/index.php/somepage"
+      },
+      "softwareRiskDetails": [
+        {
+          "consumers": [
+            "ApolloEnvironmentStageRevision:Consumer1:Prod:636268584"
+          ],
+          "riskAge": 118,
+          "targetResource": "Jackson-databind:2.9.x"
+        },
+        {
+          "consumers": [
+            "ApolloEnvironmentStageRevision:Consumer2/IAD:Gamma:638358788"
+          ],
+          "riskAge": 118,
+          "targetResource": "RubyGem-json:1.4"
+        }
+      ]
+    },
+    {
+      "associatedCampaign": {
+        "contact": "https://sim.amazon.com/issues/create?assignedFolder=12312213-7e0a-4d28-bb8a-12312312",
+        "name": "SUSAdvisoryCampaign",
+        "url": "https://w.amazon.com/index.php/somePage"
+      },
+      "softwareRiskDetails": [
+        {
+          "consumers": [
+            "ApolloEnvironmentStageRevision:Consumer2/IAD:Gamma:638358788",
+            "ApolloEnvironmentStageRevision:Consumer1:Prod:636268584"
+          ],
+          "riskAge": 76,
+          "targetResource": "Jackson-dataformat-cbor:2.6.x"
+        }
+      ]
+    }
+  ],
+  "visibility": "Internal"
+} 
+GetBrazilVersionSetDetails
+
+Retrieve summary information for Brazil VersionSet
+Required input:
+* entityId: Brazil version set name;
+* requesterLogin: requester login (usually use the same supervisor login in allowlisting SIM);
+Optional input:
+* campaignType: BLOCK/NON_ADVISORY/ADVISORY/ALL;
+    * BLOCK -- all blocked software campaigns;
+    * NON_ADVISORY -- all campaigns on the default landing page (including all BLOCK campaigns);
+    * ADVISORY -- all campaigns on the Advisory Insights tab;
+    * ALL -- all campaigns;
+* campaignId: campaign id, for example "00000000-0000-0000-0000-000000000000" for "Blocked Software Campaign - Dec 2018";
+Note: if campaignType and campaignId are both null,  it will return risk details associsted with all campaigns; If campaignId is not null, it will return risk details only associated with the given campaign id; If campaignType is not null and campaignId is null, it will return risk details only associated with the given campaign type;
+Note: It will throw coral InvalidRequestException if given entity id doesn't have any risk associsted with given campaign id or campaign type;
+Example input:
+{
+  "entityId": "someVersionSet/development",
+  "requesterLogin": "wyep"
+} 
+Example Output:
+{
+  "name": "someVersionSet/development",
+  "oldestRecommendationAge": 79,
+  "oldestRiskAge": 238,
+  "owner": "OwnerName",
+  "pipelineId": "1607",
+  "pipelineName": "somePipeline",
+  "recommendations": [
+    {
+      "actions": [
+        {
+          "details": "[{\"consumingPMV\":\"somePackage-1.0\",\"dependentPMV\":\"AmazonCoralMetricsThreadPoolSensor-1.0\"}]",
+          "template": "BRAZIL_CAN_REMOVE_DEPENDENCY"
+        }
+      ],
+      "brazilActionCount": 1,
+      "hasFullActions": true,
+      "targetResource": "AmazonCoralMetricsThreadPoolSensor:1.0"
+    },
+    {
+      "actions": [],
+      "brazilActionCount": 0,
+      "hasFullActions": false,
+      "targetResource": "CoralMetricsReporter:1.0"
+    }
+  ],
+  "riskCount": 1,
+  "softwareRisks": [
+    {
+      "associatedCampaign": {
+        "contact": "https://issues.amazon.com/issues/create?template=12312412-4642-4a56-9c7d-8d12312124236",
+        "name": "PlatformTest2",
+        "url": "https://w.amazon.com/index.php/somepage"
+      },
+      "softwareRiskDetails": [
+        {
+          "dependencies": [],
+          "recommendationAge": 79,
+          "riskAge": 238,
+          "targetResource": "NotAL2"
+        }
+      ]
+    }
+  ]
+} 
+GetCodeDeployDeploymentGroupNameDetails
+
+NOTE: CodeDeployDeploymentGroup APIs are deprecated. Please use BatchGetPipelineTargetResourceDetails.
+Required input:
+* entityId: AWS CodeDeploy deployment group name;
+* requesterLogin: requester login (usually use the same supervisor login in allowlisting SIM);
+Optional input:
+* campaignType: BLOCK/NON_ADVISORY/ADVISORY/ALL;
+    * BLOCK -- all blocked software campaigns;
+    * NON_ADVISORY -- all campaigns on the default landing page (including all BLOCK campaigns);
+    * ADVISORY -- all campaigns on the Advisory Insights tab;
+    * ALL -- all campaigns;
+* campaignId: campaign id, for example "00000000-0000-0000-0000-000000000000" for "Blocked Software Campaign - Dec 2018";
+Note: if campaignType and campaignId are both null,  it will return risk details associsted with all campaigns; If campaignId is not null, it will return risk details only associated with the given campaign id; If campaignType is not null and campaignId is null, it will return risk details only associated with the given campaign type;
+Note: It will throw coral InvalidRequestException if given entity id doesn't have any risk associsted with given campaign id or campaign type;
+Example Input:
+{
+  "entityId": "123123123:ca-central-1:SomeCodeDeployService-m-CodeDeployApp-3ZSCNEYM3HO0:SomeCodeDeployService-m-DeploymentGroup1-1080FEBJKB7GE",
+  "requesterLogin": "wyep"
+} 
+Example Output:
+{
+  "account": {
+    "accountId": "123123123",
+    "org": "AWS"
+  },
+  "name": "123123123:ca-central-1:SomeCodeDeployService-m-CodeDeployApp-3ZSCNEYM3HO0:SomeCodeDeployService-m-DeploymentGroup1-1080FEBJKB7GE",
+  "oldestRiskAge": 76,
+  "owner": "owenrName",
+  "riskCount": 51,
+  "softwareRisks": [
+    {
+      "associatedCampaign": {
+        "contact": "https://sim.amazon.com/issues/create?assignedFolder=5fe0c312312312553759",
+        "name": "SUSAdvisoryCampaign",
+        "url": "https://w.amazon.com/index.php/somepage"
+      },
+      "softwareRiskDetails": [
+        {
+          "riskAge": 76,
+          "targetResource": "Jackson-dataformat-cbor:2.6.x"
+        }
+      ]
+    },
+    {
+      "associatedCampaign": {
+        "contact": "https://issues.amazon.com/issues/create?assignedFolder=b867b140-a123123125a6",
+        "name": "Load Test Campaign Coral 1.0 Deprecation",
+        "url": "https://w.amazon.com/index.php/somepage1"
+      },
+      "softwareRiskDetails": [
+        {
+          "riskAge": 64,
+          "targetResource": "Bobcat:2.1"
+        },
+        {
+          "riskAge": 64,
+          "targetResource": "CoralActivity:1.0"
+        }
+      ]
+    }
+  ]
+} 
+GetDownstreamAggregatesWithRisk
+
+For a given aggregateId, campaignId, get list of direct downstream aggregates whose total risk count is non-zero
+Example Input:
+{
+  "aggregateId": "Person:employeeLogin",
+  "campaignId": "12312312-5172-4063-a64d-9b1f9b5df64a"
+} 
+Example Output:
+{
+  "downstreamAggregateIdList": [
+    "Person:employeeLoginA",
+    "Person:employeeLoginB",
+    "Person:employeeLoginC"
+  ]
+}  
+GetElasticContainerServiceDetails
+
+NOTE: ECS APIs are deprecated. Please use GetPipelineTargetResourceDetails.
+NOTE: ECS calls are currently disabled. They will be re-enabled in the future and this box will be removed.
+Get Elastic Container Service Details for an entity. entityId format: [AccountId]:[Region]:[Cluster]:[TaskId]
+Required input:
+* entityId: AWS Elastic container service name;
+* requesterLogin: requester login (usually use the same supervisor login in allowlisting SIM);
+Optional input:
+* campaignType: BLOCK/NON_ADVISORY/ADVISORY/ALL;
+    * BLOCK -- all blocked software campaigns;
+    * NON_ADVISORY -- all campaigns on the default landing page (including all BLOCK campaigns);
+    * ADVISORY -- all campaigns on the Advisory Insights tab;
+    * ALL -- all campaigns;
+* campaignId: campaign id, for example "00000000-0000-0000-0000-000000000000" for "Blocked Software Campaign - Dec 2018";
+Note: if campaignType and campaignId are both null,  it will return risk details associsted with all campaigns; If campaignId is not null, it will return risk details only associated with the given campaign id; If campaignType is not null and campaignId is null, it will return risk details only associated with the given campaign type;
+Note: It will throw coral InvalidRequestException if given entity id doesn't have any risk associsted with given campaign id or campaign type;
+Example Input:
+{
+  "entityId": "3153921211059:us-west-2:Cluster:4058b32371fb41c7b1d81b642bdff2ad",
+  "requesterLogin": "wyep"
+} 
+Example Output:
+{
+  "account": {
+    "accountId": "3153921211059",
+    "org": "AWS"
+  },
+  "name": "3153921211059:us-west-2:Cluster:4058b32371fb41c7b1d81b642bdff2ad",
+  "oldestRiskAge": 65,
+  "owner": "Owner Name",
+  "ownerLogin": "ownerName",
+  "pipelineId": "12345",
+  "pipelineName": "SomePipelineName",
+  "riskCount": 3,
+  "softwareRisks": [
+    {
+      "associatedCampaign": {
+        "contact": "NA",
+        "name": "OdinAWSCredential - Dry run campaign",
+        "url": "NA"
+      },
+      "softwareRiskDetails": [
+        {
+          "riskAge": 63,
+          "targetResource": "OdinAWSCredentials:1.4"
+        }
+      ]
+    },
+    {
+      "associatedCampaign": {
+        "contact": "contactInfo",
+        "name": "campaignName",
+        "url": "url about the campaign"
+      },
+      "softwareRiskDetails": [
+        {
+          "riskAge": 63,
+          "targetResource": "RiskyPackage:1.0"
+        },
+        {
+          "riskAge": 63,
+          "targetResource": "RiskyPackage2:1.1"
+        }
+      ]
+    }
+  ]
+} 
+GetResourceHighLevelDetails
+
+For a given campaign and aggregateId, get associated resource(s) high level details of given employee and all their direct reportee. e.g. resource type, name, owner, risk counts etc.
+Example Input:
+{
+    "campaignId": "ec3a359d-91bf-4feb-a47d-c3de0d2508d9",
+    "aggregateId": "Person:aytul"
+} 
+Example output:
+ {
+    "highLevelResourceDetailsByTypeMap": {
+        "ApolloEnvironmentNameAndStage": [
+            {
+                "resourceName": "GG/PDX:Prod",
+                "resourceType": "ApolloEnvironmentNameAndStage",
+                "totalRiskCountWithAction": 2,
+                "totalRiskCountWithoutAction": 0,
+                "owner": "cheryl",
+                "ownerName": "Cheryl Chen",
+                "riskAgeWithAction": 36,
+                "riskAgeWithoutAction": 0
+            },
+            {
+                "resourceName": "SUS/PDX:Prod",
+                "resourceType": "ApolloEnvironmentNameAndStage",
+                "totalRiskCountWithAction": 3,
+                "totalRiskCountWithoutAction": 1,
+                "owner": "rickquan",
+                "ownerName": "Ricky Quan",
+                "riskAgeWithAction": 30,
+                "riskAgeWithoutAction": 10
+            }
+        ],
+        "BrazilVersionSet": [
+            {
+                "resourceName": "GG/development",
+                "resourceType": "BrazilVersionSet",
+                "totalRiskCountWithAction": 0,
+                "totalRiskCountWithoutAction": 1,
+                "owner": "cheryl",
+                "ownerName": "Cheryl Chen",
+                "riskAgeWithAction": 0,
+                "riskAgeWithoutAction": 15
+            }
+        ]
+    }
+} 
+GetResourceHighLevelRiskDetailsByCampaignType
+
+For a given campaign type and aggregateId, get all associated resource(s) high level details of given employee and all their direct reports. e.g. resource type, name, owner, risk counts etc.
+Campaign Type could be:
+* campaignType: BLOCK/NON_ADVISORY/ADVISORY/ALL;
+    * BLOCK -- all blocked software campaigns;
+    * NON_ADVISORY -- all campaigns on the default landing page (including all BLOCK campaigns);
+    * ADVISORY -- all campaigns on the Advisory Insights tab;
+    * ALL -- all campaigns;
+Example Input:
+ {
+    "campaignType": "BLOCKED",
+    "aggregateId": "Person:aytul"
+} 
+Example output:
+ {
+    "highLevelResourceDetailsByResourceTypeMap": {
+        "ApolloEnvironmentNameAndStage": [
+            {
+                "resourceName": "GG/PDX:Prod",
+                "resourceType": "ApolloEnvironmentNameAndStage",
+                "totalRiskCountWithAction": 2,
+                "totalRiskCountWithoutAction": 0,
+                "owner": "cheryl",
+                "ownerName": "Cheryl Chen",
+                "riskAgeWithAction": 3,
+                "recommendationAge": 24，
+                "riskAgeWithoutAction": 0
+            },
+            {
+                "resourceName": "SUS/PDX:Prod",
+                "resourceType": "ApolloEnvironmentNameAndStage",
+                "totalRiskCountWithAction": 3,
+                "totalRiskCountWithoutAction": 1,
+                "owner": "rickquan",
+                "ownerName": "Ricky Quan",
+                "riskAgeWithAction": 30,
+                "riskAgeWithoutAction": 10
+            }
+        ],
+        "BrazilVersionSet": [
+            {
+                "resourceName": "GG/development",
+                "resourceType": "BrazilVersionSet",
+                "totalRiskCountWithAction": 0,
+                "totalRiskCountWithoutAction": 1,
+                "owner": "cheryl",
+                "ownerName": "Cheryl Chen",
+                "riskAgeWithAction": 3,
+                "riskAgeWithAction": 0,
+                "riskAgeWithoutAction": 15
+            }
+        ]
+    }
+} 
+GetRiskSummaryCount
+
+For a given aggregateId and campaignId, get the summary of total risk count, total risk with recommendation, WoW, MoM and YTD risks for the given login and his/her direct reports
+Example Input:
+{
+    "campaignId": "ec3a359d-91bf-4feb-a47d-c3de0d2508d9",
+    "aggregateId": "Person:aytul"
+} 
+Example output:
+ {
+ "owner": "aytul", 
+ "ownerName": "AYTUL ARISOY",
+ "manager": "ramensky",
+ "managerName": "Peter Ramensky",
+ "totalCount": {
+   "APOLLO_ENVIRONMENT_NAME_AND_STAGE": {
+      "totalRiskCount": 10,
+      "totalRiskCountWithRecommendation": 8,
+      "weekOverWeek": -5,
+      "monthOverMonth": -10,
+      "yearToDate": -10}
+   "BRAZIL_VERSION_SET":{
+      "totalRiskCount": 2,
+      "totalRiskCountWithRecommendation": 0,
+      "weekOverWeek": -3,
+      "monthOverMonth": -3,
+      "yearToDate": -3}
+ },
+ "individualCountList": [{
+    "ownerLogin": "aytul",
+    "ownerName": "AYTUL ARISOY",
+    "entityRiskCountMap": {
+      "APOLLO_ENVIRONMENT_NAME_AND_STAGE": {
+        "totalRiskCount": 8,
+        "totalRiskCountWithRecommendation": 6,
+        "weekOverWeek": -4,
+        "monthOverMonth": -9,
+        "yearToDate": -9}
+      "BRAZIL_VERSION_SET":{
+        "totalRiskCount": 2,
+        "totalRiskCountWithRecommendation": 0,
+        "weekOverWeek": -3,
+        "monthOverMonth": -3,
+        "yearToDate": -3}
+      }
+    },
+    {
+    "ownerLogin": "cheryl",
+    "ownerName": "Cheryl Chen",
+    "entityRiskCountMap": {
+      "APOLLO_ENVIRONMENT_NAME_AND_STAGE": {
+        "totalRiskCount": 2,
+        "totalRiskCountWithRecommendation": 2,
+        "weekOverWeek": -1,
+        "monthOverMonth": -1,
+        "yearToDate": -1}
+     }
+   }
+ ]
+} 
+GetWeeklyRiskSummaryCount
+
+For a given aggregateId and campaignId, get the weekly summary of total risk count.
+Example Input:
+ {
+    "campaignId": "9291b966-1462-48bc-af29-b362259c5bb1",
+    "aggregateId": "Person:aytul",
+    "weekNumber": 6
+ } 
+Example output:
+ {
+    "owner": "aytul",
+    "ownerName": "AYTUL ARISOY",
+    "weeklyTotalCount": {
+        "APOLLO_ENVIRONMENT_NAME_AND_STAGE": {
+            "2020-03-01": 10,
+            "2020-03-08": 8,
+            "2020-03-15": 8,
+            "2020-03-23": 7,
+            "2020-03-30": 5,
+            "2020-04-06": 4
+        },
+        "BRAZIL_VERSION_SET": {
+            "2020-03-01": 2,
+            "2020-03-08": 2,
+            "2020-03-15": 1,
+            "2020-03-23": 0,
+            "2020-03-30": 0,
+            "2020-04-06": 0
+        }
+    }
+} 
+GetResourceHighLevelRiskDetailsByPipelineId
+
+For a given campaignType and pipelineId, get high level resource details for all entities within the pipeline.
+Example Input:
+ {
+    "campaignType": "BLOCKED",
+    "pipelineId": "123456"
+ } 
+Example output:
+ {"highLevelResourceDetailsByResourceTypeMap": 
+  {"ApolloEnvironmentNameAndStage": 
+    [
+      {"blockingTimeInEpochMilli": 1655445893000, 
+       "containsBlockedResource": true, 
+       "owner": "harmesod", 
+       "ownerName": "Harmeet Sodhi", 
+       "pipelineId": "123456", 
+       "recommendationAge": 29, 
+       "resourceName": "FooWebsite/PDX:Beta", 
+       "resourceType": "ApolloEnvironmentNameAndStage", 
+       "riskAgeWithAction": 937, 
+       "riskAgeWithoutAction": 461, 
+       "riskSeverityMapWithRecommendations": 
+        {"High": 8, 
+         "Low": 13, 
+         "Medium": 0, 
+         "Critical": 0}, 
+       "riskSeverityMapWithoutRecommendations": 
+        {"High": 0, 
+         "Low": 5, 
+         "Medium": 0, 
+         "Critical": 0}, 
+       "totalRiskCountWithAction": 21, 
+       "totalRiskCountWithoutAction": 5}, 
+      {"blockingTimeInEpochMilli": 1655449098000, 
+       "containsBlockedResource": true, 
+       "owner": "harmesod", 
+       "ownerName": "Harmeet Sodhi", 
+       "pipelineId": "123456", 
+       "recommendationAge": 29, 
+       "resourceName": "FooWebsite/PDX:Prod", 
+       "resourceType": "ApolloEnvironmentNameAndStage", 
+       "riskAgeWithAction": 937, 
+       "riskAgeWithoutAction": 461, 
+       "riskSeverityMapWithRecommendations": 
+        {"High": 8, 
+         "Low": 14, 
+         "Medium": 0, 
+         "Critical": 0}, 
+       "riskSeverityMapWithoutRecommendations": 
+        {"High": 0, 
+         "Low": 5, 
+         "Medium": 0, 
+         "Critical": 0}, 
+       "totalRiskCountWithAction": 22, 
+       "totalRiskCountWithoutAction": 5}
+    ], 
+   "BrazilVersionSet": 
+    [
+      {"blockingTimeInEpochMilli": 1655366550941, 
+       "containsBlockedResource": true, 
+       "owner": "harmesod", 
+       "ownerName": "Harmeet Sodhi", 
+       "pipelineId": "123456", 
+       "recommendationAge": 670, 
+       "resourceName": "FooWebsite/development", 
+       "resourceType": "BrazilVersionSet", 
+       "riskAgeWithAction": 937, 
+       "riskAgeWithoutAction": 461, 
+       "riskSeverityMapWithRecommendations": 
+        {"High": 0, 
+         "Low": 13, 
+         "Medium": 0, 
+         "Critical": 8}, 
+       "riskSeverityMapWithoutRecommendations": 
+        {"High": 0, 
+         "Low": 5, 
+         "Medium": 0, 
+         "Critical": 0}, 
+       "totalRiskCountWithAction": 21, 
+       "totalRiskCountWithoutAction": 5}
+    ]
+  }, 
+ "pipelineName": "FooWebsite", 
+ "pipelineOwnerLogin": "harmesod", 
+ "pipelineOwnerName": "Harmeet Sodhi"}
+Common Use Cases
+
+List all containing entities (e.g. Apollo environment stages, Brazil version sets, etc.) that contains risks with recommendations in NON_ADVISORY campaign for my director's organization (directorlogin@) and the owner login
+
+APIs: BatchGetDownstreamAggregatesWithRiskByCampaignType && GetResourceHighLevelRiskDetailsByCampaignType
+1. Call GetResourceHighLevelRiskDetailsByCampaignType API with given login (directlogin@) and campaign type (NON_ADVISORY), this returns containing entities owned by given 
+   login and their direct reports;
+2. Filter out containing entities which `totalRiskCountWithAction` is 0 which means this containing entities doesn't contain any risks with recommendation,add the filtered
+   containing entities to final result;
+3. For given login (directlogin@), get direct reports who owns risks for given campaign type NON_ADVISORY by calling BatchGetDownstreamAggregatesWithRiskByCampaignType API;
+4. Add direct reports to toBeProcessed list;
+5. Repeat step #1-#4 for every item in toBeProcessed list;
+6. Return final result;
+Result: The final result would look similar as below and containing the following information:
+ {
+    "highLevelResourceDetailsByResourceTypeMap": {
+        "ApolloEnvironmentNameAndStage": [
+            {
+                "resourceName": "GG/PDX:Prod",
+                "resourceType": "ApolloEnvironmentNameAndStage",
+                "totalRiskCountWithAction": 2,
+                "totalRiskCountWithoutAction": 0,
+                "owner": "cheryl",
+                "ownerName": "Cheryl Chen",
+                "riskAgeWithAction": 36,
+                "riskAgeWithoutAction": 0
+            },
+            {
+                "resourceName": "SUS/PDX:Prod",
+                "resourceType": "ApolloEnvironmentNameAndStage",
+                "totalRiskCountWithAction": 3,
+                "totalRiskCountWithoutAction": 1,
+                "owner": "rickquan",
+                "ownerName": "Ricky Quan",
+                "riskAgeWithAction": 30,
+                "riskAgeWithoutAction": 10
+            }
+        ],
+        "BrazilVersionSet": [
+            {
+                "resourceName": "GG/development",
+                "resourceType": "BrazilVersionSet",
+                "totalRiskCountWithAction": 1,
+                "totalRiskCountWithoutAction": 0,
+                "owner": "cheryl",
+                "ownerName": "Cheryl Chen",
+                "riskAgeWithAction": 16,
+                "riskAgeWithoutAction": 0
+            }
+        ]
+    }
+} 
+List all Apollo environment with details (e.g recommendation, risk age, etc.) in NON_ADVISORY campaign for my director's orgnization (directorlogin@) and the owner login
+
+APIs: BatchGetDownstreamAggregatesWithRiskByCampaignType && GetResourceHighLevelRiskDetailsByCampaignType && BatchGetApolloEnvironmentStageDetails
+1. Call GetResourceHighLevelRiskDetailsByCampaignType API with given login (directlogin@) and campaign type (NON_ADVISORY), this returns containing entities owned by given 
+   login and their direct reports;
+2. Filter out containing entities which is not Apollo environment stage, and call BatchGetApolloEnvironmentStageDetails with the list of apollo environment stages, add the 
+   filtered containing entities to final result;
+3. For given login (directlogin@), get direct reports who owns risks for given campaign type NON_ADVISORY by calling BatchGetDownstreamAggregatesWithRiskByCampaignType API;
+4. Add direct reports to toBeProcessed list;
+5. Repeat step #1-#4 for every item in toBeProcessed list;
+6. Return final result;
+Result: The final result would look similar as below and containing the following information:
+{
+  "details": [
+    {
+      "childrenCount": 0,
+      "consumerCount": 0,
+      "hostCount": 2,
+      "name": "ApolloEnvironmentName:Prod",
+      "oldestRiskAge": 117,
+      "owner": "Owner name",
+      "ownerLogin": "ownerLogin",
+      "pipelineId": "12345",
+      "pipelineName": "SomePipelineName",
+      "recommendations": [
+        {
+          "associatedTargetResources": [
+            "CoralRubyClientBuildLogic:1.0",
+            "CoralTibcoValue:1.0",
+            "CoralTransmutingProxy:1.0",
+            "CoralBatchingSupport:1.0",
+          ],
+          "details": "{\"entity\":\"ApolloEnvironmentName:Prod\"}",
+          "template": "APOLLO_NO_ACTION"
+        },
+        {
+          "associatedTargetResources": [
+            "Jackson-databind:2.8.x"
+          ],
+          "details": "{\"consumableEnvironmentsToUpdate\":[\"SomeConsumableEnvironmentName:Prod:105326079224\"],\"entity\":\"ApolloEnvironmentName:Prod\"}",
+          "template": "APOLLO_CAN_UPDATE"
+        }
+      ],
+      "riskCount": 1,
+      "softwareRisks": [
+        {
+          "associatedCampaign": {
+            "contact": "https://sim.amazon.com/issues/create?assignedFolder=dfio1291-5fcc-47fd-8089-eeb19123f46f",
+            "name": "CDO Blocked Software Campaign",
+            "url": "https://w.amazon.com/index.php/somepages"
+          },
+          "softwareRiskDetails": [
+            {
+              "consumers": [
+                "ApolloEnvironmentStageRevision:SomeConsumableEnvironmentName:Prod:105326079224"
+              ],
+              "recommendationAge": 27,
+              "riskAge": 117,
+              "targetResource": "Jackson-databind:2.8.x"
+            }
+          ]
+        }
+      ],
+      "visibility": "Internal"
+    }
+  ]
+}
+
+Upcoming changes for NAWS risk related API
+
+To improve the current NAWS risk reporting, Builder Tools Software Assurance Services(SAS) is making changes to these APIs as we are going to move NAWS(CodeDeploy and LambdaFunction) risk reporting to be Pipeline Target based reporting. Pipeline Target reporting will also report risks in Lambda Functions, CD, ECS tasks present in the AWS account. We will stop tracking Lambda Functions and CodeDeploy Deployment Groups separately. So the SAS Dashboard and RAGS APIs will also stop reporting on the Lambda Functions and CodeDeploy Deployment Groups and start reporting on AmazonPipelineTargets instead. These changes would happen in two phases:
+* On 4/26/2023, we will add AmazonPipelineTarget entity to RAGS APIs. We will also keep reporting the Lambda Functions and CodeDeploy Deployment Groups data, so that we do not immediately introduce a breaking change to these APIs. The following new APIs will be added:
+    * GetPipelineTargetResourceDetails
+    * BatchGetPipelineTargetResourceDetails
+*  The following APIs will return a new key for pipeline target entity in the risk map:
+    * GetResourceHighLevelRiskDetailsByCampaignType
+    * GetResourceHighLevelDetailsGroupByPipeline
+    * GetResourceHighLevelRiskDetailsByCampaignTypeGroupByPipeline
+    * GetResourceHighLevelRiskDetailsByPipelineId
+    * BatchGetRiskSummaryCountByCampaignType
+    * BatchGetRiskSummaryCountByCampaignIds
+    * BatchGetWeeklyRiskSummaryCountByCampaignType
+    * GetRiskSummaryCount
+    * GetWeeklyRiskSummaryCount
+* On 6/5/2023 we will remove Lambda Functions and CodeDeploy Deployment Groups from the RAGS APIs - We will remove the usage of these NAWS entities completely from the RAGS APIs which also includes deprecating the following APIs and calling these APIs will throw an NotImplementedException after 6/5/2023.
+    * GetAWSLambdaFunctionDetails
+    * GetAWSLambdaFunctionVersionDetails
+    * GetCodeDeployDeploymentGroupNameDetails
+    * BatchGetAWSLambdaFunctionDetails
+    * BatchGetAWSLambdaFunctionVersionDetails
+    * BatchGetCodeDeployDeploymentGroupNameDetails
+* The CodeDeploy/LambdaFunction key in the risk map will be removed for the following APIs:
+    * GetResourceHighLevelDetails
+    * GetResourceHighLevelRiskDetailsByCampaignType
+    * GetResourceHighLevelDetailsGroupByPipeline
+    * GetResourceHighLevelRiskDetailsByCampaignTypeGroupByPipeline
+    * GetResourceHighLevelRiskDetailsByPipelineId
+    * BatchGetRiskSummaryCountByCampaignType
+    * BatchGetRiskSummaryCountByCampaignIds
+    * BatchGetWeeklyRiskSummaryCountByCampaignType
+    * GetRiskSummaryCount
+    * GetWeeklyRiskSummaryCount
+Here are the changes that will happen to these RAGS APIs - [Sample doc].
+
+==== WHAT ARE MY ACTIONS? ====
+No actions needed by 4/26/2023.
+Between 4/26/2023 and 6/5/2023,
+       If you are currently using one of the following APIs:
+* GetAWSLambdaFunctionDetails
+* GetAWSLambdaFunctionVersionDetails
+* GetCodeDeployDeploymentGroupNameDetails
+* BatchGetAWSLambdaFunctionDetails
+* BatchGetAWSLambdaFunctionVersionDetails
+* BatchGetCodeDeployDeploymentGroupNameDetails
+       you should migrate to use GetPipelineTargetResourceDetails and BatchGetPipelineTargetResourceDetails APIs between 4/26 and 6/5.
+
+       If you are currently using one of the following APIs:
+* GetResourceHighLevelDetails
+* GetResourceHighLevelRiskDetailsByCampaignType
+* GetResourceHighLevelDetailsGroupByPipeline
+* GetResourceHighLevelRiskDetailsByCampaignTypeGroupByPipeline
+* GetResourceHighLevelRiskDetailsByPipelineId
+* BatchGetRiskSummaryCountByCampaignType
+* BatchGetRiskSummaryCountByCampaignIds
+* BatchGetWeeklyRiskSummaryCountByCampaignType
+* GetRiskSummaryCount
+* GetWeeklyRiskSummaryCount
+     you should make code changes to read the new risk data for AmazonPipelineTarget returned in these API responses between 4/26 and 5/26.
