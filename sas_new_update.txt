@@ -1,0 +1,1154 @@
+#######################################################################################
+# Metric Provider : SAS Metrics Plug-in                                               #
+# Plugin Uses SAS dashboard data for computing SAS Metrics                            #
+# Output : Updates the RedShift Table and return the success status                    #
+#######################################################################################
+
+import re
+import os
+import sys
+import time
+import argparse
+from datetime import date
+from coral import coralrpc
+import coral.complex_types
+from retrying import retry
+from pyodinhttp import odin_retrieve_pair
+from dateutil.relativedelta import relativedelta
+from aee_oe_data_collector_aggregator_config.config.sas_config import *
+from aee_oe_data_collector_aggregator_config.config.logger import Logger
+from com.amazonaws.sasriskaggregationservice.sasriskaggregationservice import *
+from com.amazon.coral.availability.throttlingexception import ThrottlingException
+from aee_oe_data_collector_aggregator.utilities.downloadUploadToS3 import S3_Operations
+from aee_oe_data_collector_aggregator_config.config.basic_config import Common_Constants, ODIN, COMMANDS
+from aee_oe_data_collector_aggregator.utilities.redshift_operation_wrapper import redshift_operation_wrapper
+
+
+class SAS_Plugin:
+
+    def __init__(self):
+        Logger.printLogs("INFO","Triggering SAS Plugin")
+        self.rs_upsert = redshift_operation_wrapper()
+
+    def SAS_Init(Self):
+        # Fetching access key and secret key from admin ODIN
+        aws_access_key_id,aws_secret_access_key = odin_retrieve_pair(ODIN.AEE_ODIN)
+        aws_access_key_id = aws_access_key_id.data.decode('utf-8').encode()
+        aws_secret_access_key = aws_secret_access_key.data.decode('utf-8').encode()
+
+        # Creating orchestrator for client
+        _orchestrator = coralrpc.new_orchestrator(
+                         endpoint=SAS_Config.endpoint,
+                         aws_service=SAS_Config.service,
+                         aws_region=SAS_Config.region,
+                         signature_algorithm='v4',
+                         timeout=30, # 30 seconds why? New service so we don't know about the latency
+                         aws_access_key=aws_access_key_id,
+                         aws_secret_key=aws_secret_access_key,
+                         aws_security_token = SAS_Config.security_token)
+
+        # Creating SAS risk client
+        return SASRiskAggregationServiceClient(_orchestrator)
+
+    def _string_to_camelcase(self, s):
+        return re.sub(r'(?:^|_)(.)', lambda m: m.group(1).upper(), s)
+
+
+    def coral_to_python(self, obj):
+        if isinstance(obj, coral.complex_types.List):
+            return [self.coral_to_python(el) for el in obj]
+        if isinstance(obj, coral.complex_types.Structure):
+            required_string = {}
+            for propname in dir(obj):
+                if propname.startswith('_'):
+                    continue
+                required_string[self._string_to_camelcase(propname)] = self.coral_to_python(getattr(obj, propname))
+            return required_string
+        if isinstance(obj, coral.simple_types.String):
+            return str(obj)
+        if isinstance(obj, coral.simple_types.Boolean):
+            return bool(obj)
+        return obj
+
+    def get_entities(self):
+        '''
+        This function fetches the client names from Config file and returns client names.
+        '''
+        select_result = self.rs_upsert.run_redshift_select_query(SAS_Config.get_distinct_leader)
+        Logger.printLogs("DEBUG","Query result {}".format(select_result))
+        if select_result == 1:
+            Logger.printLogs("EXCEPTION","Query resulted in exception and returned {}".format(select_result))
+            sys.exit(1)
+
+        entities = []
+        for clients in select_result:
+            entities.append(clients[0])
+        if len(entities) < 2:
+            entities = str("('") + entities[0] + str("')")
+        else:
+            entities = tuple(entities)
+        return entities
+
+    def get_distinct_managers(self, entities):
+        '''
+        Based on the entities from get_entities function, this function fetches, all the employees under that login.
+        '''
+        try:
+            Logger.printLogs("INFO", " Calling Manager To Manager Aggregate Mapping Query")
+            manager_to_manager_aggregate_mapping = self.rs_upsert.run_redshift_select_query(SAS_Config.manager_to_manager_aggregate_mapping_query.format(entities))
+
+            if manager_to_manager_aggregate_mapping == 1:
+                Logger.printLogs("ERROR","Manager Aggregate relation Mapping query failed with Error code 1")
+                sys.exit(1)
+
+            if len(manager_to_manager_aggregate_mapping) < 1:
+                Logger.printLogs("WARNING","manager aggregate relation mapping is empty")
+
+            distinct_managers = set()
+            manager_to_entity_mapping = {}
+            for mapping in manager_to_manager_aggregate_mapping:
+                roll_up_to_manager = mapping[0]
+                manager = mapping[1]
+                if roll_up_to_manager in entities:
+                    distinct_managers.add(manager)
+                    manager_to_entity_mapping.update({manager:roll_up_to_manager})
+
+                    if len(distinct_managers) >= 10:
+                        break
+            return tuple(distinct_managers), manager_to_entity_mapping, manager_to_manager_aggregate_mapping
+
+        except Exception as error:
+            Logger.printLogs("[ ERROR ]","Getting distinct managers failed with error {}".format(error))
+            sys.exit(1)
+
+    def load_SAS_data_to_redshift(self, program_name):
+        '''
+        Truncate the rawdata tables and update the new rawdata in tables. 
+        Input: program_name i.e. type of SAS riks
+        '''
+        if (program_name == SAS_Config.program_name_apollo):
+            try:
+                os.system(COMMANDS.Redshift_Operations_Command.format(ODIN.Redshift_ODIN,"truncate table {}".format(SAS_Config.test_temp_redshift_apollo_table)))
+                Logger.printLogs("INFO","Truncate table '{}' completed successfully.".format(SAS_Config.test_temp_redshift_apollo_table))
+                os.system(COMMANDS.Redshift_Operations_Command.format(ODIN.Redshift_ODIN,"truncate table " + SAS_Config.test_redshift_apollo_table))
+                Logger.printLogs("INFO","Truncate table '{}' completed successfully.".format(SAS_Config.test_redshift_apollo_table))
+                os.system(COMMANDS.Redshift_Update_Comamnd.format(ODIN.Redshift_ODIN,"csv",SAS_Config.test_temp_redshift_apollo_table,Common_Constants.S3_Bucket+'/'+SAS_Config.sas_apollo_temp_s3_location))
+                Logger.printLogs("INFO","Data updation to table '{}' completed successfully.".format(SAS_Config.test_temp_redshift_apollo_table))
+                os.system(COMMANDS.Redshift_Operations_Command.format(ODIN.Redshift_ODIN,SAS_Config.query_for_getting_required_data.format(SAS_Config.test_redshift_apollo_table,SAS_Config.test_temp_redshift_apollo_table)))
+                Logger.printLogs("INFO","Unique Data updation to table '{}' completed successfully.".format(SAS_Config.test_redshift_apollo_table))
+
+            except Exception as error:
+                Logger.printLogs("[ ERROR ]","Transferring Apollo data to redshift table failed with message : {}".format(error))
+                sys.exit(1)
+
+        elif (program_name == SAS_Config.program_name_brazil):
+            try:
+                os.system(COMMANDS.Redshift_Operations_Command.format(ODIN.Redshift_ODIN,"truncate table {}".format(SAS_Config.test_temp_redshift_brazil_table)))
+                Logger.printLogs("INFO","Truncate table '{}' completed successfully.".format(SAS_Config.test_temp_redshift_brazil_table))
+                os.system(COMMANDS.Redshift_Operations_Command.format(ODIN.Redshift_ODIN,"truncate table " + SAS_Config.test_redshift_brazil_table))
+                Logger.printLogs("INFO","Truncate table '{}' completed successfully.".format(SAS_Config.test_redshift_brazil_table))
+                os.system(COMMANDS.Redshift_Update_Comamnd.format(ODIN.Redshift_ODIN,"csv",SAS_Config.test_temp_redshift_brazil_table,Common_Constants.S3_Bucket+'/'+SAS_Config.sas_brazil_temp_s3_location))
+                Logger.printLogs("INFO","Data updation to table '{}' completed successfully.".format(SAS_Config.test_temp_redshift_brazil_table))
+                os.system(COMMANDS.Redshift_Operations_Command.format(ODIN.Redshift_ODIN,SAS_Config.query_for_getting_required_data.format(SAS_Config.test_redshift_brazil_table,SAS_Config.test_temp_redshift_brazil_table)))
+                Logger.printLogs("INFO","Unique Data updation to table '{}' completed successfully.".format(SAS_Config.test_redshift_brazil_table))
+
+            except Exception as error:
+                Logger.printLogs("[ ERROR ]","Transferring Brazil data to redshift table failed with message : {}".format(error))
+                sys.exit(1)
+
+        elif (program_name == SAS_Config.program_name_pipeline_targets):
+            try:
+                os.system(COMMANDS.Redshift_Operations_Command.format(ODIN.Redshift_ODIN,"truncate table {}".format(SAS_Config.test_temp_redshift_pipeline_target_table)))
+                Logger.printLogs("INFO","Truncate table '{}' completed successfully.".format(SAS_Config.test_temp_redshift_pipeline_target_table))
+                os.system(COMMANDS.Redshift_Operations_Command.format(ODIN.Redshift_ODIN,"truncate table " + SAS_Config.test_redshift_pipeline_target_table))
+                Logger.printLogs("INFO","Truncate table '{}' completed successfully.".format(SAS_Config.test_redshift_pipeline_target_table))
+                os.system(COMMANDS.Redshift_Update_Comamnd.format(ODIN.Redshift_ODIN,"csv",SAS_Config.test_temp_redshift_pipeline_target_table,Common_Constants.S3_Bucket+'/'+SAS_Config.sas_pipeline_target_temp_s3_location))
+                Logger.printLogs("INFO","Data updation to table '{}' completed successfully.".format(SAS_Config.test_temp_redshift_pipeline_target_table))
+                os.system(COMMANDS.Redshift_Operations_Command.format(ODIN.Redshift_ODIN,SAS_Config.query_for_getting_required_data.format(SAS_Config.test_redshift_pipeline_target_table,SAS_Config.test_temp_redshift_pipeline_target_table)))
+                Logger.printLogs("INFO","Unique Data updation to table '{}' completed successfully.".format(SAS_Config.test_redshift_pipeline_target_table))
+
+            except Exception as error:
+                Logger.printLogs("ERROR","Transferring Pipeline Target data to redshift table failed with message : {}".format(error))
+                sys.exit(1)
+        else:
+            Logger.printLogs("ERROR","Wrong Program name passed")
+            return
+
+    def get_severity_based_risks(self, high_level_data):
+        """Process severity information from RAGS API response"""
+        try:
+            # Log the actual response structure
+            data = self.coral_to_python(high_level_data) if not isinstance(high_level_data, dict) else high_level_data
+
+            severity_counts = {
+                "EMERGENCY": 0,
+                "CRITICAL": 0,
+                "HIGH": 0
+            }
+
+            for resource_type, resources in data.get('HighLevelResourceDetailsByResourceTypeMap', {}).items():
+                for resource in resources:
+                    risk_age = resource.get('OldestRiskAge', 0)
+                    if risk_age > 30:
+                        severity_counts["EMERGENCY"] += 1
+                    elif risk_age > 20:
+                        severity_counts["CRITICAL"] += 1
+                    else:
+                        severity_counts["HIGH"] += 1
+            return severity_counts
+        
+        except Exception as error:
+            Logger.printLogs("[ ERROR ]", "Getting severity based risks failed with error {}".format(error))
+            return {"HIGH":0}
+
+    def get_risk_priority(self, risk_age):
+        """Get risk priority based on risk age"""
+        try:
+            risk_age = int(risk_age) if isinstance(risk_age, str) else risk_age
+            if risk_age > 30:
+                return 3
+            elif risk_age > 20:
+                return 2
+            return 1
+        except Exception as e:
+            Logger.printLogs("ERROR", f"Error calculating priority: {e}")
+            return 1
+
+    
+    def get_severity(self, severity_data):
+        """Get severity based on severity data"""
+        try:
+            if severity_data.get('EMERGENCY', 0) > 0:
+                return 'EMERGENCY'
+            elif severity_data.get('CRITICAL', 0) > 0:
+                return 'CRITICAL'
+            elif severity_data.get('HIGH', 0) > 0:
+                return 'HIGH'
+            return 'LOW'
+        except Exception as e:
+            Logger.printLogs("ERROR", f"Error determining severity: : {e}")
+            return 'HIGH'  # Default to HIGH if error
+
+
+    def create_metrics(self, _client, metric_snapshot):
+        '''
+        Main function, responsible to start generating metrics.
+        Input: 
+        _client: Client of SAS API
+        metric_snapshot: Type of metrics refresh i.e. WoW or MoM
+        '''
+        entities = self.get_entities()
+        distinct_managers, manager_to_entity_mapping, manager_to_manager_aggregate_mapping =self.get_distinct_managers(entities)
+        Logger.printLogs("[INFO]", f"Starting processing for {len(distinct_managers)} managers")
+        self.apollo_file = open(SAS_Config.sas_apollo_temp_file,"w")
+        self.brazil_file = open(SAS_Config.sas_brazil_temp_file,"w")
+        self.pipeline_file = open(SAS_Config.sas_pipeline_target_temp_file,"w")
+        self.metric_snapshot = metric_snapshot
+        Logger.printLogs("[INFO]","Executing it for all managers")
+        iterator = 0
+        for manager in distinct_managers:
+            Logger.printLogs("[UPDATE]","{} Managers left to process".format(len(distinct_managers)-iterator))
+            iterator = iterator+1
+
+            data = self.call_get_high_level_resource_details(manager, _client)
+            if data == 1:  # Error case
+                Logger.printLogs("ERROR", "Failed to get high level details")
+                continue
+            final_list_of_apollo_environments = []
+            final_list_of_brazil_environments = []
+            final_list_of_pipeline_targets = []
+
+            try:
+                resource_map = data.get('data', {}).get('HighLevelResourceDetailsByResourceTypeMap', {})
+
+                apollo_result = resource_map.get('ApolloEnvironmentNameAndStage', [])
+                if apollo_result:
+                    final_list_of_apollo_environments = self.process_high_level_data(apollo_result, SAS_Config.program_name_apollo)
+            except Exception as err:
+                Logger.printLogs("[INFO]", "No Apollo sas risks found ! {}".format(err))
+            try:
+                brazil_data = resource_map.get('BrazilVersionSet', [])
+                if brazil_data:
+                    final_list_of_brazil_environments = self.process_high_level_data(brazil_data, SAS_Config.program_name_brazil)
+            except Exception as err:
+                Logger.printLogs("[INFO]","No Brazil version set SAS risk found ! {}".format(err))
+
+            try:
+                pipeline_target_data = resource_map.get('AmazonPipelineTarget', [])
+                if pipeline_target_data:
+                    final_list_of_pipeline_targets = self.process_high_level_data(pipeline_target_data, SAS_Config.program_name_pipeline_targets)
+            except Exception as err:
+                Logger.printLogs("[INFO]","No Pipeline target SAS risk found ! {}".format(err))
+
+            try:
+
+                self.call_batch_details_wrapper(manager, _client, final_list_of_apollo_environments, SAS_Config.program_name_apollo)
+
+                self.call_batch_details_wrapper(manager, _client, final_list_of_brazil_environments, SAS_Config.program_name_brazil)
+
+                self.call_batch_details_wrapper(manager,_client,final_list_of_pipeline_targets, SAS_Config.program_name_pipeline_targets)
+
+
+            except Exception as error:
+                Logger.printLogs("ERROR","Getting final details of SAS failed with error {}".format(error))
+                sys.exit(1)
+
+        self.apollo_file.close()
+        self.brazil_file.close()
+        self.pipeline_file.close()
+
+        try:
+            S3_Operations.uploadDataToS3(ODIN.S3_ODIN, Common_Constants.S3_Bucket, SAS_Config.sas_apollo_temp_s3_location, SAS_Config.sas_apollo_temp_file)
+            self.load_SAS_data_to_redshift(SAS_Config.program_name_apollo)
+        except Exception as err:
+            Logger.printLogs("[ERROR]","Error occurred while uploading Apollo csv file to S3 bucket. {}".format(err))
+            sys.exit(1)
+
+        try:
+            S3_Operations.uploadDataToS3(ODIN.S3_ODIN, Common_Constants.S3_Bucket, SAS_Config.sas_brazil_temp_s3_location, SAS_Config.sas_brazil_temp_file)
+            self.load_SAS_data_to_redshift(SAS_Config.program_name_brazil)
+        except Exception as err:
+            Logger.printLogs("[ERROR]","Error occurred while uploading Brazil csv file to S3 bucket. {}".format(err))
+            sys.exit(1)
+
+        try:
+            S3_Operations.uploadDataToS3(ODIN.S3_ODIN, Common_Constants.S3_Bucket, SAS_Config.sas_pipeline_target_temp_s3_location, SAS_Config.sas_pipeline_target_temp_file)
+            self.load_SAS_data_to_redshift(SAS_Config.program_name_pipeline_targets)
+        except Exception as err:
+            Logger.printLogs("[ERROR]","Error occurred while uploading Pipeline Target csv file to S3 bucket. {}".format(err))
+            sys.exit(1)
+
+        try:
+
+            Logger.printLogs("INFO","Starting Rolling up of SAS metrics")
+            roll_return_code = self.roll_up_metrics(distinct_managers)
+
+            Logger.printLogs("INFO","Starting Aggregating SAS metrics")
+            self.aggregate_metrics(distinct_managers)
+
+            Logger.printLogs("INFO","Updating refresh status of SAS metrics")
+            self.insert_success_refresh_status()
+
+            Logger.printLogs("INFO","Updating duplicate tables of SAS metrics for Manual update of OE Risks")
+            self.insert_sas_data_into_duplicate_table()
+
+        except Exception as err:
+            Logger.printLogs("ERROR","SAS Plug-in failed with error {}".format(err))
+            sys.exit(1)
+
+    # def process_high_level_data(self, result, resource_type):
+    #   '''
+    #   Function is responsible to get all environments or resources from result and return consolidated list.
+    #   Input: Result, metric_snapshot and type of resource
+    #   Output: Consolidated list of Environments
+    #   '''
+    #   final_list_environments = []
+    #   for environment in result:
+    #       environment_json_info = self.coral_to_python(environment)
+    #       env_name = environment_json_info['ResourceName']
+    #       Logger.printLogs("[DEBUG]","{} environment {} added to list".format(resource_type, env_name))
+    #       final_list_environments.append(env_name)
+
+    #   return final_list_environments
+
+    def get_week_number(self):
+        """Get current week number"""
+        return date.today().isocalendar()[1]
+
+    def process_high_level_data(self, result, resource_type):
+        '''
+        Process resource data and return consolidated list
+        '''
+        try:
+            final_list_environments = []
+            if not result:
+                return final_list_environments
+            for environment in result:
+                if isinstance(environment, dict):
+                    env_name = environment.get('ResourceName')
+                else:
+                    environment_json_info = self.coral_to_python(environment)
+                    env_name = environment_json_info.get('ResourceName')
+                if env_name:
+                    Logger.printLogs("DEBUG", f"{resource_type} environment {env_name} added to list")
+                    final_list_environments.append(env_name)
+            return final_list_environments
+        except Exception as err:
+            Logger.printLogs("INFO", f"No {resource_type} risk found! {err}")
+            return []
+
+
+    def get_apollo_data_and_write_in_file(self, data, file, metric_snapshot):
+        '''
+        Fetches all the details from processed Apollo data and writes into a csv file.
+        '''
+        list_data = self.coral_to_python(data)
+        for filtered_depth_data in list_data['Details']:
+            env_name = filtered_depth_data['Name']
+            stage_name = env_name.split(':')[1]
+            owner_login = filtered_depth_data['OwnerLogin']
+            children_count = filtered_depth_data['ChildrenCount']
+            consumer_count = filtered_depth_data['ConsumerCount']
+            host_count = filtered_depth_data['HostCount']
+            owner = filtered_depth_data['Owner']
+            pipeline_id = filtered_depth_data['PipelineId']
+            pipeline_name = filtered_depth_data['PipelineName']
+            oldest_risk_age = filtered_depth_data['OldestRiskAge']
+            risk_count = filtered_depth_data['RiskCount']
+            visibility = filtered_depth_data['Visibility']
+            recommendation_with_action = {}
+            severity_data = self.get_severity_based_risks(filtered_depth_data['AggregateId'])
+            severity = self.get_severity(severity_data)
+            for recommendation in filtered_depth_data['Recommendations']:
+                for target_resource in recommendation['AssociatedTargetResources']:
+                    recommendation_with_action[target_resource] = recommendation['Template']
+
+            for software_risk in filtered_depth_data['SoftwareRisks']:
+                for risk_details in software_risk['SoftwareRiskDetails']:
+                    blocked_resources = risk_details['TargetResource']
+                    action_required = recommendation_with_action[blocked_resources]
+                    associated_campaigns = software_risk['AssociatedCampaign']['Name'].replace(",","")
+
+                    oldest_risk_age = risk_details['RiskAge']
+                    oldest_recommendation_age = str(risk_details['RecommendationAge'])
+
+                    if (not oldest_recommendation_age.isnumeric()):
+                        oldest_recommendation_age = '-1'
+
+                    current_date = date.today()
+                    snapshot_number = current_date.isocalendar()[1]
+                    classification = 'None'
+                    curent_year = current_date.strftime('%Y')
+                    
+                    risk_priority = self.get_risk_priority(oldest_risk_age)
+                    file.write("{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n".format(env_name,
+                                                                                                         stage_name,
+                                                                                                         pipeline_id,
+                                                                                                         pipeline_name,
+                                                                                                         owner,
+                                                                                                         owner_login,
+                                                                                                         consumer_count,
+                                                                                                         children_count,
+                                                                                                         risk_count,
+                                                                                                         visibility,
+                                                                                                         host_count,
+                                                                                                         oldest_risk_age,
+                                                                                                         oldest_recommendation_age,
+                                                                                                         action_required,
+                                                                                                         blocked_resources,
+                                                                                                         associated_campaigns,
+                                                                                                         current_date,
+                                                                                                         curent_year,
+                                                                                                         classification,
+                                                                                                         metric_snapshot,
+                                                                                                         snapshot_number,
+                                                                                                         severity,
+                                                                                                         risk_priority))
+
+    def get_brazil_data_and_write_in_file(self, data, file, metric_snapshot):
+        '''
+        Fetches all the details from processed Brazil data and writes into a csv file.
+        '''
+        list_data = self.coral_to_python(data)
+        for version_set_json_info in list_data['Details']:
+            version_set = version_set_json_info['Name']
+            owner_login = version_set_json_info['OwnerLogin']
+            owner = version_set_json_info['Owner']
+
+            pipeline_id = version_set_json_info['PipelineId']
+            pipeline_name = version_set_json_info['PipelineName']
+            oldest_recommendation_age = version_set_json_info['OldestRecommendationAge']
+            oldest_risk_age = version_set_json_info['OldestRiskAge']
+            risk_count = version_set_json_info['RiskCount']
+
+            recommendation_with_action = {}
+            severity_data = self.get_severity_based_risks(version_set_json_info['AggregateId'])
+            severity = self.get_severity(severity_data)
+            for recommendation in version_set_json_info['Recommendations']:
+                for target_resource in recommendation['Actions']:
+                    recommendation_with_action[recommendation['TargetResource']] = target_resource['Template']
+
+            for software_risk in version_set_json_info['SoftwareRisks']:
+                for risk_details in software_risk['SoftwareRiskDetails']:
+                    blocked_resources = risk_details['TargetResource']
+                    try:
+                        action_required = recommendation_with_action[blocked_resources]
+                    except Exception as err:
+                        action_required = 'None'
+                    associated_campaigns = software_risk['AssociatedCampaign']['Name']
+                    oldest_risk_age = risk_details['RiskAge']
+                    oldest_recommendation_age = str(risk_details['RecommendationAge'])
+
+                    if (not oldest_recommendation_age.isnumeric()):
+                        oldest_recommendation_age = '-1'
+
+                    current_date = date.today()
+                    snapshot_number = current_date.isocalendar()[1]
+                    classification = 'None'
+                    curent_year = current_date.strftime('%Y')
+                    
+                    risk_priority = self.get_risk_priority(oldest_risk_age)
+                    file.write("{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n".format(version_set,
+                                                                                          pipeline_id,
+                                                                                          pipeline_name,
+                                                                                          owner,
+                                                                                          owner_login,
+                                                                                          risk_count,
+                                                                                          oldest_risk_age,
+                                                                                          oldest_recommendation_age,
+                                                                                          blocked_resources,
+                                                                                          action_required,
+                                                                                          associated_campaigns,
+                                                                                          current_date,
+                                                                                          curent_year,
+                                                                                          classification,
+                                                                                          metric_snapshot,
+                                                                                          snapshot_number,
+                                                                                          severity,
+                                                                                          risk_priority))
+
+    def get_pipeline_target_data_and_write_in_file(self, data, file, metric_snapshot):
+        '''
+        Fetches all the details from processed pipeline target data and writes into a csv file.
+        '''
+        list_data = self.coral_to_python(data)
+        for pipeline_target_json_info in list_data['Details']:
+            target_name = pipeline_target_json_info['Name']
+            pipeline_name = pipeline_target_json_info['PipelineName']
+            pipeline_id = pipeline_target_json_info['PipelineId']
+            owner_name = pipeline_target_json_info['Owner']
+            owner_login = pipeline_target_json_info['OwnerLogin']
+            oldest_risk_age = pipeline_target_json_info['OldestRiskAge']
+            risk_count = pipeline_target_json_info['RiskCount']
+
+            recommendation_with_action = {}
+            severity_data = self.get_severity_based_risks(pipeline_target_json_info['AggregateId'])
+            severity = self.get_severity(severity_data)
+
+            try:
+                for recommendation in pipeline_target_json_info['Recommendations']:
+                    for target_resource in recommendation['Actions']:
+                        recommendation_with_action[recommendation['TargetResource']] = target_resource['Template']
+            except Exception as err:
+                Logger.printLogs("INFO", "Please Refer to Associated campaign urls to follow the recommendation")
+
+            for software_risk in pipeline_target_json_info['SoftwareRisks']:
+                for risk_details in software_risk['SoftwareRiskDetails']:
+                    blocked_resources = risk_details['TargetResource']
+                try:
+                    action_required = recommendation_with_action[blocked_resources]
+                except Exception as err:
+                    action_required = 'None'
+                associated_campaigns = software_risk['AssociatedCampaign']['Name']
+                oldest_risk_age = risk_details['RiskAge']
+
+                try:
+                    oldest_recommendations_age = str(risk_details['RecommendationAge'])
+                except Exception:
+                    Logger.printLogs("INFO","Recommendation Age is not configured in Pipeline Target plug-in, setting default value")
+                    oldest_recommendations_age = '-1'
+
+                current_date = date.today()
+                snapshot_number = current_date.isocalendar()[1]
+                classification = 'None'
+                current_year = current_date.strftime('%Y')
+                
+                risk_priority = self.get_risk_priority(oldest_risk_age)
+                file.write("{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n".format(target_name,
+                                                                                      pipeline_id,
+                                                                                      pipeline_name,
+                                                                                      owner_name,
+                                                                                      owner_login,
+                                                                                      risk_count,
+                                                                                      oldest_risk_age,
+                                                                                      oldest_recommendations_age,
+                                                                                      blocked_resources,
+                                                                                      action_required,
+                                                                                      associated_campaigns,
+                                                                                      current_date,
+                                                                                      current_year,
+                                                                                      classification,
+                                                                                      metric_snapshot,
+                                                                                      snapshot_number,
+                                                                                      severity,
+                                                                                      risk_priority
+                                                                                      ))
+
+    @retry(wait_fixed=10000, stop_max_attempt_number=3)
+    def call_get_high_level_resource_details(self, manager, _client):
+        '''
+        Makes API call to get the high level SAS risk details for any particular manager. It includes all Blocked SAS risks.
+        '''
+        try:
+            response = _client.get_resource_high_level_risk_details_by_campaign_type(aggregate_id = "Person:"+manager, campaign_type='BLOCKED')
+            data = self.coral_to_python(response)
+            # Convert response to dict
+            Logger.printLogs("DEBUG", f"API Response Structure: {data}")
+            return {
+            'data': data,
+            'severity_info': self.get_severity_based_risks(data)
+        }
+        
+        except ThrottlingException as e:
+            Logger.printLogs("EXCEPTION","ThrottlingException occurred, Sleeping! {}".format(e))
+            time.sleep(5)
+        except Exception as err:
+            Logger.printLogs("[ERROR]","Error occurred {}".format(err))
+            return 1
+
+    def call_batch_details_wrapper(self, manager, _client, final_list_of_environments, type_of_env):
+        '''
+        This is the wrapper function, which is responsible to limit the batch size to 100 of every request.
+        '''
+        batch_iterations = len(final_list_of_environments)// SAS_Config.BATCH_SIZE +1
+        Logger.printLogs("[INFO]","Inside Call Batch Wrapper function: Total Batches required {}".format(batch_iterations))
+
+        try:
+            for start_range in range(0,len(final_list_of_environments),SAS_Config.BATCH_SIZE):
+                end_range = start_range + SAS_Config.BATCH_SIZE
+
+                consolidated_data = self.call_batch_details(manager, _client, final_list_of_environments[start_range:end_range], type_of_env)
+
+                if type_of_env == SAS_Config.program_name_apollo and consolidated_data != 1:
+                    self.get_apollo_data_and_write_in_file(consolidated_data, self.apollo_file, self.metric_snapshot)
+                elif type_of_env == SAS_Config.program_name_brazil and consolidated_data != 1:
+                    self.get_brazil_data_and_write_in_file(consolidated_data, self.brazil_file, self.metric_snapshot)
+                elif type_of_env == SAS_Config.program_name_pipeline_targets and consolidated_data != 1:
+                    self.get_pipeline_target_data_and_write_in_file(consolidated_data, self.pipeline_file, self.metric_snapshot)
+
+        except Exception as err:
+            Logger.printLogs("[ERROR]","Error occurred {}".format(err))
+            sys.exit(1)
+
+        return
+
+
+    @retry(wait_fixed=10000, stop_max_attempt_number=3)
+    def call_batch_details(self, manager, _client, final_list_of_environments, type_of_env):
+        '''
+        This function takes list of environments as input and fetches all detailed information.
+        '''
+        Logger.printLogs("[DEBUG]","Batch Length is {}".format(len(final_list_of_environments)))
+        try:
+            if (type_of_env == SAS_Config.program_name_apollo):
+                data = _client.batch_get_apollo_environment_stage_details(requester_login = manager, entity_id_list=final_list_of_environments, campaign_type='BLOCKED')
+            elif (type_of_env == SAS_Config.program_name_brazil):
+                data = _client.batch_get_brazil_version_set_details(requester_login = manager, entity_id_list=final_list_of_environments, campaign_type='BLOCKED')
+            elif (type_of_env == SAS_Config.program_name_pipeline_targets):
+                data = _client.batch_get_pipeline_target_resource_details(requester_login = manager, entity_id_list = final_list_of_environments, campaign_type = 'BLOCKED')
+            else:
+                Logger.printLogs("ERROR","Wrong type_of_env is passed, Please check! ")
+
+        except ThrottlingException as error:
+            Logger.printLogs("EXCEPTION","ThrottlingException occurred, Sleeping! {}".format(error))
+            time.sleep(5)
+        except Exception as err:
+            Logger.printLogs("[ERROR]","Error occurred {}".format(err))
+            return 1
+
+        return data
+
+    def roll_up_metrics(self, distinct_managers):
+        '''
+        Function responsible for Rolling up the metrics by using Rawdata tables.
+        '''
+        Logger.printLogs("[INFO]","Starting rolling up of SAS metrics")
+
+        for manager in distinct_managers:
+
+
+            insert_apollo_result = self.rs_upsert.execute_redshift_sql_query(SAS_Config.roll_upto_manager_query.format(SAS_Config.test_rolled_redshift_apollo_table,
+                                                                                                          manager,
+                                                                                                          SAS_Config.test_redshift_apollo_table))
+            Logger.printLogs("[DEBUG]","Apollo Data rolled upto query for {} manager result {}".format(manager, insert_apollo_result))
+
+
+            insert_brazil_result = self.rs_upsert.execute_redshift_sql_query(SAS_Config.roll_upto_manager_query.format(SAS_Config.test_rolled_redshift_brazil_table,
+                                                                                                          manager,
+                                                                                                          SAS_Config.test_redshift_brazil_table))
+            Logger.printLogs("[DEBUG]","Brazil Data rolled upto query for {} manager result {}".format(manager, insert_brazil_result))
+
+
+            insert_pipeline_target_result = self.rs_upsert.execute_redshift_sql_query(SAS_Config.roll_upto_manager_query.format(SAS_Config.test_rolled_redshift_pipeline_target_table,
+                                                                                                          manager,
+                                                                                                          SAS_Config.test_redshift_pipeline_target_table))
+            Logger.printLogs("[DEBUG]","Pipeline Target Data rolled upto query for {} manager result {}".format(manager, insert_pipeline_target_result))
+
+            if (insert_apollo_result != 0 or insert_brazil_result != 0 or insert_pipeline_target_result != 0):
+                Logger.printLogs("ERROR","Query failed to roll the data for manager {}".format(manager))
+                sys.exit(1)
+
+
+
+    def aggregate_metrics(self, distinct_managers):
+        '''
+        This function creates Aggregate metrics from the Rolled up data
+        '''
+        Logger.printLogs("[INFO]","Starting Aggregate Rolled up of SAS metrics")
+        manager_processed = 0
+        for manager in distinct_managers:
+
+            manager_processed = manager_processed + 1
+
+            Logger.printLogs("[DEBUG]","Manager processed [{}]/[{}]".format(manager_processed,len(distinct_managers)))
+
+
+            insert_total_result = self.rs_upsert.execute_redshift_sql_query(SAS_Config.aggregate_roll_upto_total_query.format(SAS_Config.test_sas_risk_summary, manager))
+            Logger.printLogs("[DEBUG]","Total Metrics rolled upto {} manager query result {}".format(manager, insert_total_result))
+
+
+            insert_recommended_result = self.rs_upsert.execute_redshift_sql_query(SAS_Config.aggregate_roll_upto_recommendation_query.format(SAS_Config.test_sas_risk_summary, manager))
+            Logger.printLogs("[DEBUG]","Recommendations Metrics rolled upto {} manager query result {}".format(manager, insert_recommended_result))
+
+
+            insert_older_recommendation_result = self.rs_upsert.execute_redshift_sql_query(SAS_Config.aggregate_roll_upto_long_recommendation_query.format(SAS_Config.test_sas_risk_summary, manager))
+            Logger.printLogs("[DEBUG]","Recommendations Metrics rolled upto {} manager query result {}".format(manager, insert_older_recommendation_result))
+
+
+            insert_recommended_result = self.rs_upsert.execute_redshift_sql_query(SAS_Config.aggregate_roll_upto_near_sla_query.format(SAS_Config.test_sas_risk_summary, manager))
+            Logger.printLogs("[DEBUG]","SLA near missed Metrics rolled upto {} manager query result {}".format(manager, insert_recommended_result))
+
+            insert_severity_result = self.rs_upsert.execute_redshift_sql_query(SAS_Config.aggregate_roll_upto_severity_query.format(SAS_Config.test_sas_risk_summary, SAS_Config.test_redshift_apollo_table, SAS_Config.test_redshift_brazil_table,SAS_Config.test_redshift_pipeline_target_table),(manager, date.today(), 'WoW', self.get_week_number(),manager,date.today().year,'severity_based'))
+            Logger.printLogs("[DEBUG]", "Severity Metrics rolled upto {} manager query result {}".format(manager, insert_severity_result))
+
+            if (insert_total_result !=0 or insert_recommended_result != 0 or insert_older_recommendation_result != 0 or insert_severity_result !=0):
+                Logger.printLogs("ERROR","Aggregation Query Execution failed for manager {}".format(manager))
+                sys.exit(1)
+
+
+
+    def insert_success_refresh_status(self):
+        '''
+        Updates the refresh status when plug-in runs successfullly.
+        '''
+
+        try:
+            next_run_date = date.today() + relativedelta(days=7)
+            insert_status = self.rs_upsert.execute_redshift_sql_query(SAS_Config.insert_status_of_sas_run.format(date.today(), date.today(),next_run_date))
+            Logger.printLogs("DEBUG","Status Insertion Query result {}".format(insert_status))
+
+        except Exception as error:
+            Logger.printLogs("ERROR","Inserting refresh status failed with message: {}".format(error))
+            sys.exit(1)
+
+    def insert_sas_data_into_duplicate_table(self):
+        '''
+        Inserting data into respective SAS tables for Manual OE risk update in Amazon Arik portal.
+        '''
+        try:
+            #Adding SAS Apollo data to duplicate table for Manual update of SAS Risks [AmazonArik OE Risk]
+            insert_status_apollo = self.rs_upsert.execute_redshift_sql_query(SAS_Config.sas_temp_apollo_insert_query)
+            Logger.printLogs("INFO","Data update to duplicate apollo sas table '{}' completed successfully {}.".format(SAS_Config.test_redshift_apollo_table_v2, insert_status_apollo))
+
+            #Adding SAS Brazil data to duplicate table for Manual update of SAS Risks [AmazonArik OE Risk]
+            insert_status_brazil = self.rs_upsert.execute_redshift_sql_query(SAS_Config.sas_temp_brazil_insert_query)
+            Logger.printLogs("INFO","Data update to duplicate brazil sas table '{}' completed successfully {}.".format(SAS_Config.test_redshift_brazil_table_v2, insert_status_brazil))
+
+            #Adding SAS Pipeline Target data to duplicate table for Manual update of SAS Risks [AmazonArik OE Risk]
+            insert_status_pipeline_target = self.rs_upsert.execute_redshift_sql_query(SAS_Config.sas_temp_pipeline_target_insert_query)
+            Logger.printLogs("INFO","Data update to duplicate Pipeline target sas table '{}' completed successfully {}.".format(SAS_Config.test_redshift_pipeline_target_table_v2, insert_status_pipeline_target))
+
+        except Exception as error:
+            Logger.printLogs("ERROR","Inserting into duplicate table status failed with message: {}".format(error))
+            sys.exit(1)
+
+def main():
+    obj = SAS_Plugin()
+    _client = obj.SAS_Init()
+    parser = argparse.ArgumentParser(description='Getting the Snapshot type of SAS Plug-in')
+    parser.add_argument('-s', '--snapshot',  nargs="*", help='Plugin Snapshot Type: WoW / MoM', required=True)
+    args = vars(parser.parse_args())
+    metric_snapshot = args['snapshot'][0]
+    obj.create_metrics(_client, metric_snapshot)
+
+if __name__ == "__main__":
+    main()
+
+___________________________________
+class SAS_Config:
+
+    region = "us-west-2"
+
+    security_token = None
+
+    service = "sas-rags-frontend-prod"
+
+    endpoint = "https://sas-rags-frontend-prod-global-pdx.pdx.proxy.amazon.com"
+    
+    severity_emergency = 'EMERGENCY'
+
+    severity_critical = 'CRITICAL'
+    
+    severity_high = 'HIGH'
+
+    test_redshift_apollo_table = "aeetest.raw_sas_apollo_metrics"
+    test_redshift_brazil_table = "aeetest.raw_sas_brazil_metrics"
+    test_redshift_pipeline_target_table = "aeetest.raw_sas_pipeline_target_metrics"
+
+    test_redshift_apollo_table_v2 = "aeetest.raw_sas_apollo_metrics_v2"
+    test_redshift_brazil_table_v2 = "aeetest.raw_sas_brazil_metrics_v2"
+    test_redshift_pipeline_target_table_v2 = "aeetest.raw_sas_pipeline_target_metrics_v2"
+
+    test_temp_redshift_apollo_table = "aeetest.temp_sas_apollo_metrics"
+    test_temp_redshift_brazil_table = "aeetest.temp_sas_brazil_metrics"
+    test_temp_redshift_pipeline_target_table = "aeetest.temp_sas_pipeline_target_metrics"
+
+    test_rolled_redshift_apollo_table = "aeetest.rolled_sas_apollo_metrics"
+    test_rolled_redshift_brazil_table = "aeetest.rolled_sas_brazil_metrics"
+    test_rolled_redshift_pipeline_target_table = "aeetest.rolled_sas_pipeline_target_metrics"
+
+    test_sas_risk_summary = "aeetest.sas_risk_summary"
+
+    severity_aggregate_query = """
+    insert into {} (
+        risk_count,
+        metric_rolled_up_to,
+        metric_run_date,
+        metric_snapshot,
+        metric_snapshot_number,
+        aggregate_roll_up_to,
+        metric_year,
+        metric_type,
+        severity
+    )
+    select
+        count(*) as risk_count,
+        %s as metric_roll_up_to,
+        %s as metric_run_date,
+        %s as metric_snapshot,
+        %s as metric_snapshot_number,
+        %s as aggregate_roll_up_to,
+        %s as metric_year,
+        %s as metric_type,
+        severity
+    from (
+        select severity, metric_run_date from {}
+        union all
+        select severity, metric_run_date from {}
+        union all
+        select severity, metric_run_date from {}
+    ) as combined_risks
+    where metric_run_date = %s
+    group by severity,
+    """
+    # sas_aggregate_table = "aggregate_schema.sas_risk_summary"
+
+    sas_apollo_temp_s3_location = "P0_metrics_raw_data/SAS/SAS_Apollo_File.csv"
+
+    sas_brazil_temp_s3_location = "P0_metrics_raw_data/SAS/SAS_Brazil_File.csv"
+
+    sas_pipeline_target_temp_s3_location = "P0_metrics_raw_data/SAS/SAS_Pipeline_Target_File.csv"
+
+    sas_apollo_temp_file = "/apollo/env/AEE-OE-Data-Collector-Aggregator/var/SAS_Apollo_File.csv"
+
+    sas_brazil_temp_file = "/apollo/env/AEE-OE-Data-Collector-Aggregator/var/SAS_Brazil_File.csv"
+
+    sas_pipeline_target_temp_file = "/apollo/env/AEE-OE-Data-Collector-Aggregator/var/SAS_Pipeline_Target_File.csv"
+
+    sas_status_query = """insert into x values('{}','{}','{}','{}','{}','{}','{}','{}','{}','{}')"""
+
+    # redshift_apollo_table = "rawdata_schema.raw_sas_apollo_metrics"
+
+    # redshift_brazil_table = "rawdata_schema.raw_sas_brazil_metrics"
+
+    # redshift_pipeline_target_table = "rawdata_schema.raw_sas_pipeline_target_metrics"
+
+    # redshift_apollo_table_v2 = "rawdata_schema.sas_apollo_metrics_v2"
+
+    # redshift_brazil_table_v2 = "rawdata_schema.sas_brazil_metrics_v2"
+
+    # redshift_pipeline_target_table_v2 = "rawdata_schema.sas_pipeline_target_metrics_v2"
+
+    # temp_redshift_apollo_table = "rawdata_schema.temp_sas_apollo_metrics"
+
+    # temp_redshift_brazil_table = "rawdata_schema.temp_sas_brazil_metrics"
+
+    # temp_redshift_pipeline_target_table = "rawdata_schema.temp_sas_pipeline_target_metrics"
+
+    # rolled_redshift_apollo_table = "rawdata_schema.sas_apollo_metrics"
+
+    # rolled_redshift_brazil_table = "rawdata_schema.sas_brazil_metrics"
+
+    # rolled_redshift_pipeline_target_table = "rawdata_schema.sas_pipeline_target_metrics"
+
+    program_name_apollo = 'APOLLO'
+
+    program_name_brazil = 'BRAZIL'
+
+    program_name_pipeline_targets = 'PIPELINE_TARGET'
+
+    pipeline_target_function_flag = 'PIPELINE_TARGET_FUNCTION'
+
+    BATCH_SIZE = 100
+
+    query_for_getting_required_data = """insert into {} select distinct * from {}"""
+
+    get_distinct_leader = "select distinct leader from relationship_schema.p0_clients_primary"
+
+    insert_status_of_sas_run = """ 
+    insert into aeetest.page0_plugin_run_status 
+    values('ALLORG','ALLManager','','SAS','SAS Risks',0,'{}','{}','Weekly','{}');
+    """
+
+    manager_to_manager_aggregate_mapping_query = """
+    select relation_entity,relation_manager FROM 
+    relationship_schema.entity_manager_relationship WHERE relation_entity IN (SELECT DISTINCT relation_manager FROM 
+    relationship_schema.entity_manager_relationship WHERE relation_entity IN {0}) and 
+    relation_rundate in (select max(relation_rundate) from relationship_schema.entity_manager_relationship)"""
+
+    roll_upto_manager_query = """
+    insert into {0} (
+    select *,
+           '{1}' AS rolled_upto
+    FROM {2}
+    WHERE owner_login IN (SELECT DISTINCT login_name
+                      FROM BOOKER.D_EMPLOYEE_DETAILS
+                      WHERE supervisor_login_name IN (SELECT DISTINCT relation_manager
+                                                      FROM relationship_schema.entity_manager_relationship
+                                                      WHERE relation_entity = '{1}'))
+    UNION all
+    SELECT *,
+           '{1}' AS rolled_upto
+    FROM {2}
+    WHERE owner_login = '{1}')
+    """
+
+    aggregate_roll_upto_total_query ="""
+    insert into {0} (
+    select count(risk_name) as risk_count,aggregate_roll_up_to,metric_run_date,
+    metric_snapshot,metric_snapshot_number,'{1}' as aggregate_rolled_upto,metric_year,'total' as metric_type 
+    from (
+    select apollo_environment_name as risk_name,aggregate_roll_up_to,metric_run_date,metric_snapshot,
+    metric_snapshot_number,metric_year,days_non_compliant,days_non_compliant_recommendation,apollo_action as action_type
+    from aeetest.sas_apollo_metrics where metric_run_date = 
+    (select max(metric_run_date) from aeetest.sas_apollo_metrics) and aggregate_roll_up_to in 
+    (SELECT DISTINCT login_name
+                          FROM BOOKER.D_EMPLOYEE_DETAILS
+                          WHERE supervisor_login_name IN ('{1}'))
+    union all
+    select brazil_versionset_name as risk_name,aggregate_roll_up_to,metric_run_date,metric_snapshot,
+    metric_snapshot_number,metric_year,days_non_compliant,days_non_compliant_recommendation,brazil_action_type as action_type
+     from aeetest.sas_brazil_metrics where metric_run_date = 
+    (select max(metric_run_date) from aeetest.sas_brazil_metrics) and aggregate_roll_up_to in
+    (SELECT DISTINCT login_name
+                          FROM BOOKER.D_EMPLOYEE_DETAILS
+                          WHERE supervisor_login_name IN ('{1}'))
+    union all
+    select pipeline_target_name as risk_name,aggregate_roll_up_to,metric_run_date,metric_snapshot,
+    metric_snapshot_number,metric_year,days_non_compliant,days_non_compliant_recommendation,pipeline_target_action_type as action_type
+    from aeetest.sas_pipeline_target_metrics where metric_run_date = 
+    (select max(metric_run_date) from aeetest.sas_pipeline_target_metrics) and aggregate_roll_up_to in 
+    (SELECT DISTINCT login_name
+                          FROM BOOKER.D_EMPLOYEE_DETAILS
+                          WHERE supervisor_login_name IN ('{1}')))
+    group by aggregate_roll_up_to,metric_run_date,metric_snapshot,aggregate_rolled_upto,metric_year,metric_snapshot_number
+    union all
+    select count(risk_name) as risk_count,aggregate_roll_up_to,metric_run_date,
+    metric_snapshot,metric_snapshot_number,'{1}' as aggregate_rolled_upto,metric_year,'total' as metric_type 
+    from (
+    select apollo_environment_name as risk_name,aggregate_roll_up_to,metric_run_date,metric_snapshot,
+    metric_snapshot_number,metric_year,days_non_compliant,days_non_compliant_recommendation,apollo_action as action_type
+    from aeetest.sas_apollo_metrics where metric_run_date = 
+    (select max(metric_run_date) from aeetest.sas_apollo_metrics) and aggregate_roll_up_to in ('{1}')
+    union all
+    select brazil_versionset_name as risk_name,aggregate_roll_up_to,metric_run_date,metric_snapshot,
+    metric_snapshot_number,metric_year,days_non_compliant,days_non_compliant_recommendation,brazil_action_type as action_type
+     from aeetest.sas_brazil_metrics where metric_run_date = 
+    (select max(metric_run_date) from aeetest.sas_brazil_metrics) and aggregate_roll_up_to in ('{1}')
+    union all
+    select pipeline_target_name as risk_name,aggregate_roll_up_to,metric_run_date,metric_snapshot,
+    metric_snapshot_number,metric_year,days_non_compliant,days_non_compliant_recommendation,pipeline_target_action_type as action_type
+    from aeetest.sas_pipeline_target_metrics where metric_run_date = 
+    (select max(metric_run_date) from aeetest.sas_pipeline_target_metrics) and aggregate_roll_up_to in ('{1}'))
+    group by aggregate_roll_up_to,metric_run_date,metric_snapshot,aggregate_roll_up_to,metric_year,metric_snapshot_number)
+    """
+
+    aggregate_roll_upto_near_sla_query = """
+    insert into {0} (
+    select count(risk_name) as risk_count,aggregate_roll_up_to,metric_run_date,
+    metric_snapshot,metric_snapshot_number,'{1}' as aggregate_rolled_upto,metric_year,'75DaySASRisk' as metric_type 
+    from (
+    select apollo_environment_name as risk_name,aggregate_roll_up_to,metric_run_date,metric_snapshot,
+    metric_snapshot_number,metric_year,days_non_compliant,days_non_compliant_recommendation,apollo_action as action_type
+    from aeetest.sas_apollo_metrics where metric_run_date = (select max(metric_run_date) from aeetest.sas_apollo_metrics) and aggregate_roll_up_to in 
+    (SELECT DISTINCT login_name
+                          FROM BOOKER.D_EMPLOYEE_DETAILS
+                          WHERE supervisor_login_name IN ('{1}'))  and 
+        cast(days_non_compliant_recommendation as int) >= 20 and 
+        cast(days_non_compliant_recommendation as int) < 30
+    union all
+    select brazil_versionset_name as risk_name,aggregate_roll_up_to,metric_run_date,metric_snapshot,
+    metric_snapshot_number,metric_year,days_non_compliant,days_non_compliant_recommendation,brazil_action_type as action_type
+     from aeetest.sas_brazil_metrics where metric_run_date = (select max(metric_run_date) from aeetest.sas_apollo_metrics) and aggregate_roll_up_to in
+    (SELECT DISTINCT login_name
+                          FROM BOOKER.D_EMPLOYEE_DETAILS
+                          WHERE supervisor_login_name IN ('{1}')) and 
+        cast(days_non_compliant_recommendation as int) >= 20 and 
+        cast(days_non_compliant_recommendation as int) < 30)
+    group by aggregate_roll_up_to,metric_run_date,metric_snapshot,aggregate_rolled_upto,metric_year,metric_snapshot_number
+    union all
+    select count(risk_name) as risk_count,aggregate_roll_up_to,metric_run_date,
+    metric_snapshot,metric_snapshot_number,'{1}' as aggregate_rolled_upto,metric_year,'75DaySASRisk' as metric_type 
+    from (
+    select apollo_environment_name as risk_name,aggregate_roll_up_to,metric_run_date,metric_snapshot,
+    metric_snapshot_number,metric_year,days_non_compliant,days_non_compliant_recommendation,apollo_action as action_type
+    from aeetest.sas_apollo_metrics where metric_run_date = (select max(metric_run_date) from aeetest.sas_apollo_metrics) and aggregate_roll_up_to in ('{1}')  and 
+        cast(days_non_compliant_recommendation as int) >= 20 and 
+        cast(days_non_compliant_recommendation as int) < 30
+    union all
+    select brazil_versionset_name as risk_name,aggregate_roll_up_to,metric_run_date,metric_snapshot,
+    metric_snapshot_number,metric_year,days_non_compliant,days_non_compliant_recommendation,brazil_action_type as action_type
+     from aeetest.sas_brazil_metrics where metric_run_date = (select max(metric_run_date) from aeetest.sas_apollo_metrics) and aggregate_roll_up_to in ('{1}')  and 
+        cast(days_non_compliant_recommendation as int) >= 20 and 
+        cast(days_non_compliant_recommendation as int) < 30)
+    group by aggregate_roll_up_to,metric_run_date,metric_snapshot,aggregate_roll_up_to,metric_year,metric_snapshot_number)
+    """
+
+    aggregate_roll_upto_recommendation_query = """
+    insert into {0} (
+    select count(risk_name) as risk_count,aggregate_roll_up_to,metric_run_date,
+    metric_snapshot,metric_snapshot_number,'{1}' as aggregate_rolled_upto,metric_year,'recommendations' as metric_type 
+    from (
+    select apollo_environment_name as risk_name,aggregate_roll_up_to,metric_run_date,metric_snapshot,
+    metric_snapshot_number,metric_year,days_non_compliant,days_non_compliant_recommendation,apollo_action as action_type
+    from aeetest.sas_apollo_metrics where metric_run_date = (select max(metric_run_date) from aeetest.sas_apollo_metrics)
+    and aggregate_roll_up_to in 
+    (SELECT DISTINCT login_name
+                          FROM BOOKER.D_EMPLOYEE_DETAILS
+                          WHERE supervisor_login_name IN ('{1}'))  and 
+        cast(days_non_compliant_recommendation as int) > 0
+    union all
+    select brazil_versionset_name as risk_name,aggregate_roll_up_to,metric_run_date,metric_snapshot,
+    metric_snapshot_number,metric_year,days_non_compliant,days_non_compliant_recommendation,brazil_action_type as action_type
+     from aeetest.sas_brazil_metrics where metric_run_date = 
+    (select max(metric_run_date) from aeetest.sas_apollo_metrics) and aggregate_roll_up_to in
+    (SELECT DISTINCT login_name
+                          FROM BOOKER.D_EMPLOYEE_DETAILS
+                          WHERE supervisor_login_name IN ('{1}')) and 
+        cast(days_non_compliant_recommendation as int) > 0)
+    group by aggregate_roll_up_to,metric_run_date,metric_snapshot,aggregate_rolled_upto,metric_year,metric_snapshot_number
+    union all
+    select count(risk_name) as risk_count,aggregate_roll_up_to,metric_run_date,
+    metric_snapshot,metric_snapshot_number,'{1}' as aggregate_rolled_upto,metric_year,'recommendations' as metric_type 
+    from (
+    select apollo_environment_name as risk_name,aggregate_roll_up_to,metric_run_date,metric_snapshot,
+    metric_snapshot_number,metric_year,days_non_compliant,days_non_compliant_recommendation,apollo_action as action_type
+    from aeetest.sas_apollo_metrics where metric_run_date = 
+    (select max(metric_run_date) from aeetest.sas_apollo_metrics) and aggregate_roll_up_to in ('{1}')  and 
+        cast(days_non_compliant_recommendation as int) > 0
+    union all
+    select brazil_versionset_name as risk_name,aggregate_roll_up_to,metric_run_date,metric_snapshot,
+    metric_snapshot_number,metric_year,days_non_compliant,days_non_compliant_recommendation,brazil_action_type as action_type
+     from aeetest.sas_brazil_metrics where metric_run_date = 
+    (select max(metric_run_date) from aeetest.sas_apollo_metrics) and aggregate_roll_up_to in ('{1}')  and 
+        cast(days_non_compliant_recommendation as int) > 0)
+    group by aggregate_roll_up_to,metric_run_date,metric_snapshot,aggregate_roll_up_to,metric_year,metric_snapshot_number)
+    """
+
+    aggregate_roll_upto_long_recommendation_query = """
+    insert into {0} (
+    select count(risk_name) as risk_count,aggregate_roll_up_to,metric_run_date,
+    metric_snapshot,metric_snapshot_number,'{1}' as aggregate_rolled_upto,metric_year,'90DaySASRisk' as metric_type 
+    from (
+    select apollo_environment_name as risk_name,aggregate_roll_up_to,metric_run_date,metric_snapshot,
+    metric_snapshot_number,metric_year,days_non_compliant,days_non_compliant_recommendation,apollo_action as action_type
+    from aeetest.sas_apollo_metrics where metric_run_date = 
+    (select max(metric_run_date) from aeetest.sas_apollo_metrics) and aggregate_roll_up_to in 
+    (SELECT DISTINCT login_name
+                          FROM BOOKER.D_EMPLOYEE_DETAILS
+                          WHERE supervisor_login_name IN ('{1}'))  and 
+        cast(days_non_compliant_recommendation as int) > 30
+    union all
+    select brazil_versionset_name as risk_name,aggregate_roll_up_to,metric_run_date,metric_snapshot,
+    metric_snapshot_number,metric_year,days_non_compliant,days_non_compliant_recommendation,brazil_action_type as action_type
+     from aeetest.sas_brazil_metrics where metric_run_date = 
+    (select max(metric_run_date) from aeetest.sas_brazil_metrics) and aggregate_roll_up_to in
+    (SELECT DISTINCT login_name
+                          FROM BOOKER.D_EMPLOYEE_DETAILS
+                          WHERE supervisor_login_name IN ('{1}')) and 
+        cast(days_non_compliant_recommendation as int) > 30)
+    group by aggregate_roll_up_to,metric_run_date,metric_snapshot,aggregate_rolled_upto,metric_year,metric_snapshot_number
+    union all
+    select count(risk_name) as risk_count,aggregate_roll_up_to,metric_run_date,
+    metric_snapshot,metric_snapshot_number,'{1}' as aggregate_rolled_upto,metric_year,'90DaySASRisk' as metric_type 
+    from (
+    select apollo_environment_name as risk_name,aggregate_roll_up_to,metric_run_date,metric_snapshot,
+    metric_snapshot_number,metric_year,days_non_compliant,days_non_compliant_recommendation,apollo_action as action_type
+    from aeetest.sas_apollo_metrics where metric_run_date = 
+    (select max(metric_run_date) from aeetest.sas_apollo_metrics) and aggregate_roll_up_to in ('{1}')  and 
+        cast(days_non_compliant_recommendation as int) > 30
+    union all
+    select brazil_versionset_name as risk_name,aggregate_roll_up_to,metric_run_date,metric_snapshot,
+    metric_snapshot_number,metric_year,days_non_compliant,days_non_compliant_recommendation,brazil_action_type as action_type
+     from aeetest.sas_brazil_metrics where metric_run_date = 
+    (select max(metric_run_date) from aeetest.sas_brazil_metrics) and aggregate_roll_up_to in ('{1}')  and 
+        cast(days_non_compliant_recommendation as int) > 30)
+    group by aggregate_roll_up_to,metric_run_date,metric_snapshot,aggregate_roll_up_to,metric_year,metric_snapshot_number)
+    """
+
+    '''
+    Insert query to copy retrieve data from parent table to new table with Max(rundate)
+    for Manual update of OE Risks by SE/Dev in Arik portal project.
+
+    Master ticket - https://issues.amazon.com/issues/AEESE-3612
+    '''
+
+    sas_temp_apollo_insert_query = """
+    INSERT INTO aeetest.sas_apollo_metrics_v2 (apollo_environment_name, apollo_environment_stage, pipeline_id,
+    pipeline_name, owner, owner_login, consumers, children, software_count, visibility, host_count, days_non_compliant,
+    days_non_compliant_recommendation, apollo_action, blocked_resources, associated_campaigns, metric_run_date, metric_year,
+    classification, metric_snapshot, metric_snapshot_number, aggregate_roll_up_to, severity, risk_priority) 
+    SELECT apollo_environment_name, apollo_environment_stage, pipeline_id, pipeline_name, owner, owner_login, consumers,
+    children, software_count, visibility, host_count, days_non_compliant, days_non_compliant_recommendation, apollo_action,
+    blocked_resources, associated_campaigns, metric_run_date, metric_year, classification, metric_snapshot, metric_snapshot_number,
+    aggregate_roll_up_to,severity, risk_priority FROM aeetest.sas_apollo_metrics
+    WHERE metric_run_date = (SELECT MAX(metric_run_date) FROM aeetest.sas_apollo_metrics)
+    """
+
+    sas_temp_brazil_insert_query = """
+    INSERT INTO aeetest.sas_brazil_metrics_v2 (brazil_versionset_name, pipeline_id, pipeline_name, owner, owner_login,
+    software_count, days_non_compliant, days_non_compliant_recommendation, blocked_resource, brazil_action_type, associated_campaigns,
+    metric_run_date, metric_year, classification, metric_snapshot, metric_snapshot_number, aggregate_roll_up_to,severity, risk_priority) 
+    SELECT brazil_versionset_name, pipeline_id, pipeline_name, owner, owner_login, software_count, days_non_compliant,
+    days_non_compliant_recommendation, blocked_resource, brazil_action_type, associated_campaigns, metric_run_date, metric_year,
+    classification, metric_snapshot, metric_snapshot_number, aggregate_roll_up_to,severity, risk_priority FROM aeetest.sas_brazil_metrics
+    WHERE metric_run_date = (SELECT MAX(metric_run_date) FROM aeetest.sas_brazil_metrics)
+    """
+
+    sas_temp_pipeline_target_insert_query = """
+    INSERT INTO aeetest.sas_pipeline_target_metrics_v2 (pipeline_target_name, pipeline_id, pipeline_name, owner, owner_login,
+    software_count, days_non_compliant, days_non_compliant_recommendation, blocked_resource, pipeline_target_action_type, associated_campaigns,
+    metric_run_date, metric_year, classification, metric_snapshot, metric_snapshot_number, aggregate_roll_up_to,severity, risk_priority) 
+    SELECT pipeline_target_name, pipeline_id, pipeline_name, owner, owner_login, software_count, days_non_compliant,
+    days_non_compliant_recommendation, blocked_resource, pipeline_target_action_type, associated_campaigns, metric_run_date, metric_year,
+    classification, metric_snapshot, metric_snapshot_number, aggregate_roll_up_to,severity, risk_priority FROM aeetest.sas_pipeline_target_metrics
+    WHERE metric_run_date = (SELECT MAX(metric_run_date) FROM aeetest.sas_pipeline_target_metrics)
+    """
+
+
+___________________________________
+
+[ Sun Feb 23 17:19:27 2025 ] [ INFO ] Triggering SAS Plugin
+[ Sun Feb 23 17:19:29 2025 ] [ INFO ] Established Connection to Redshift Database ... 
+[ Sun Feb 23 17:19:30 2025 ] [ INFO ] Running Query ...
+[ Sun Feb 23 17:19:30 2025 ] [ SUCCESS ] Execution successfull 
+[ Sun Feb 23 17:19:30 2025 ] [ DEBUG ] Query result [['tapas'], ['russ'], ['anbhuvan'], ['posadan'], ['jglastra'], ['jags'], ['premald'], ['skaushik'], ['yanweng'], ['zheyinli'], ['agrim'], ['ronnie'], ['gupsweta'], ['sarmato'], ['hannahm'], ['danlloyd']]
+[ Sun Feb 23 17:19:30 2025 ] [ INFO ]  Calling Manager To Manager Aggregate Mapping Query
+[ Sun Feb 23 17:19:30 2025 ] [ INFO ] Running Query ...
+[ Sun Feb 23 17:19:31 2025 ] [ SUCCESS ] Execution successfull 
+[ Sun Feb 23 17:19:31 2025 ] [ [INFO] ] Starting processing for 10 managers
+[ Sun Feb 23 17:19:31 2025 ] [ [INFO] ] Executing it for all managers
+[ Sun Feb 23 17:19:31 2025 ] [ [UPDATE] ] 10 Managers left to process
+[ Sun Feb 23 17:19:31 2025 ] [ DEBUG ] API Response Structure: {'HighLevelResourceDetailsByResourceTypeMap': {'AmazonPipelineTarget': [<HighLevelResourceDetails(resource_type='AmazonPipelineTarget', resource_name='us-west-2:2019023:ConnectBetaToProd:DG', total_risk_count_with_action=0, total_risk_count_without_action=1, owner='praspan', owner_name='Prashant Pandey', pipeline_id='2019023', risk_age_with_action=-1, risk_age_without_action=655, recommendation_age=-1, contains_blocked_resource=True, risk_severity_map_with_recommendations={'High': 0, 'Critical': 0, 'Low': 0, 'Medium': 0}, risk_severity_map_without_recommendations={'High': 0, 'Critical': 0, 'Low': 0, 'Medium': 1})>, <HighLevelResourceDetails(resource_type='AmazonPipelineTarget', resource_name='us-west-2:2019023:Pipeline_Support:DG', total_risk_count_with_action=0, total_risk_count_without_action=1, owner='praspan', owner_name='Prashant Pandey', pipeline_id='2019023', risk_age_with_action=-1, risk_age_without_action=655, recommendation_age=-1, contains_blocked_resource=True, risk_severity_map_with_recommendations={'High': 0, 'Critical': 0, 'Low': 0, 'Medium': 0}, risk_severity_map_without_recommendations={'High': 0, 'Critical': 0, 'Low': 0, 'Medium': 1})>, <HighLevelResourceDetails(resource_type='AmazonPipelineTarget', resource_name='us-west-2:2019023:Pipeline:DG', total_risk_count_with_action=0, total_risk_count_without_action=1, owner='praspan', owner_name='Prashant Pandey', pipeline_id='2019023', risk_age_with_action=-1, risk_age_without_action=655, recommendation_age=-1, contains_blocked_resource=True, risk_severity_map_with_recommendations={'High': 0, 'Critical': 0, 'Low': 0, 'Medium': 0}, risk_severity_map_without_recommendations={'High': 0, 'Critical': 0, 'Low': 0, 'Medium': 1})>, <HighLevelResourceDetails(resource_type='AmazonPipelineTarget', resource_name='us-west-2:2019023:Beta-DataIngestion:DG', total_risk_count_with_action=0, total_risk_count_without_action=1, owner='praspan', owner_name='Prashant Pandey', pipeline_id='2019023', risk_age_with_action=-1, risk_age_without_action=655, recommendation_age=-1, contains_blocked_resource=True, risk_severity_map_with_recommendations={'High': 0, 'Critical': 0, 'Low': 0, 'Medium': 0}, risk_severity_map_without_recommendations={'High': 0, 'Critical': 0, 'Low': 0, 'Medium': 1})>, <HighLevelResourceDetails(resource_type='AmazonPipelineTarget', resource_name='us-west-2:2019023:Prod-DataIngestion-NA:DG', total_risk_count_with_action=0, total_risk_count_without_action=1, owner='praspan', owner_name='Prashant Pandey', pipeline_id='2019023', risk_age_with_action=-1, risk_age_without_action=655, recommendation_age=-1, contains_blocked_resource=True, risk_severity_map_with_recommendations={'High': 0, 'Critical': 0, 'Low': 0, 'Medium': 0}, risk_severity_map_without_recommendations={'High': 0, 'Critical': 0, 'Low': 0, 'Medium': 1})>]}, 'Name': 'Sumeet Palkar', 'ToCoralName': <bound method Structure.to_coral_name of <class 'com.amazonaws.sasriskaggregationservice.getresourcehighlevelriskdetailsbycampaigntyperesponse.GetResourceHighLevelRiskDetailsByCampaignTypeResponse'>>, 'ToPropertyName': <bound method Structure.to_property_name of <class 'com.amazonaws.sasriskaggregationservice.getresourcehighlevelriskdetailsbycampaigntyperesponse.GetResourceHighLevelRiskDetailsByCampaignTypeResponse'>>}
+[ Sun Feb 23 17:19:31 2025 ] [ [ ERROR ] ] Getting severity based risks failed with error 'HighLevelResourceDetails' object has no attribute 'get'
+[ Sun Feb 23 17:19:31 2025 ] [ DEBUG ] PIPELINE_TARGET environment us-west-2:2019023:ConnectBetaToProd:DG added to list
+[ Sun Feb 23 17:19:31 2025 ] [ DEBUG ] PIPELINE_TARGET environment us-west-2:2019023:Pipeline_Support:DG added to list
+[ Sun Feb 23 17:19:31 2025 ] [ DEBUG ] PIPELINE_TARGET environment us-west-2:2019023:Pipeline:DG added to list
+[ Sun Feb 23 17:19:31 2025 ] [ DEBUG ] PIPELINE_TARGET environment us-west-2:2019023:Beta-DataIngestion:DG added to list
+[ Sun Feb 23 17:19:31 2025 ] [ DEBUG ] PIPELINE_TARGET environment us-west-2:2019023:Prod-DataIngestion-NA:DG added to list
+[ Sun Feb 23 17:19:31 2025 ] [ [INFO] ] Inside Call Batch Wrapper function: Total Batches required 1
+[ Sun Feb 23 17:19:31 2025 ] [ [INFO] ] Inside Call Batch Wrapper function: Total Batches required 1
+[ Sun Feb 23 17:19:31 2025 ] [ [INFO] ] Inside Call Batch Wrapper function: Total Batches required 1
+[ Sun Feb 23 17:19:31 2025 ] [ [DEBUG] ] Batch Length is 5
+[ Sun Feb 23 17:19:32 2025 ] [ [ERROR] ] Error occurred 'AggregateId'
+[ Sun Feb 23 17:19:32 2025 ] [ INFO ] Connection Destroyed ...
