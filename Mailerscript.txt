@@ -1,0 +1,704 @@
+import argparse
+import json
+import time
+import traceback
+from datetime import datetime
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+import boto3
+import pandas as pd
+from amazonsecuresmtp.client import AmazonSecureSMTPClient
+from pyodinhttp import odin_retrieve_pair
+from aee_oe_data_collector_aggregator_config.config.logger import Logger
+from aee_oe_data_collector_aggregator_config.config.basic_config import Common_Constants, ODIN
+from aee_oe_data_collector_aggregator.utilities.retriveDataFromRedshift_module import REDSHIFT_OPERATION
+from aee_oe_data_collector_aggregator.utilities.redshiftUtilitiesForUpsert import redshiftUtilitiesForUpsert
+from aee_oe_data_collector_aggregator.utilities.loadRedshiftwithS3Data_module import REDSHIFT_LOAD
+from aee_oe_data_collector_aggregator_config.config.pipeline_deployment_status_config import PIPELINE_DEPLOYMENT, ATHENA_QUERY, ATHENA_CONSTANT, REDSHIFT_TABLE, S3_CONSTANTS, REDSHIFT_QUERIES, EMAIL_CONSTANTS
+
+"""Pipeline Deployment Status Script
+
+This script generates and sends a weekly pipeline health status report showing merge frequency and deployment metrics.
+
+Usage:
+    Test Run:
+        python pipeline_deployment_status.py -t test [-teid test@amazon.com] [-tc cc_test@amazon.com]
+        
+    Production Run:
+        python pipeline_deployment_status.py -t prod
+
+Email Distribution:
+    Test Mode:
+        - TO: Specified test email (or aee-se-primary@amazon.com if not specified)
+        - CC: Specified CC email (or same as TO if not specified)
+    
+    Production Mode:
+        - TO: All active managers (fetched from managers table)
+        - CC: Support engineers for each manager
+             If no support engineer is assigned, cc's aee-se-primary@amazon.com
+
+Arguments:
+    -t, --isTestRun    : Required. Either 'test' or 'prod'
+    -teid, --testEmailId: Optional. Test recipient email address
+    -tc, --testCcEmail : Optional. Test CC email address
+
+Example:
+    Test run with specific recipients:
+        python pipeline_deployment_status.py -t test -teid manager@amazon.com -tc support@amazon.com
+    
+    Production run:
+        python pipeline_deployment_status.py -t prod
+"""
+
+def parseFlags():
+    parser = argparse.ArgumentParser(description='Pipeline Deployment Status Script')
+    parser.add_argument('-t', '--isTestRun', choices=['test', 'prod'], help='Is Test Run', required=True)
+    parser.add_argument('-teid', '--testEmailId', help='Test Email ID', required=False)
+    parser.add_argument('-tc', '--testCcEmail', help='Test CC Email ID', required=False)
+    parser.add_argument('-q', '--quipLink', help='Quip Link', required=False)
+    return vars(parser.parse_args())
+    
+def get_aws_client(service_name, odin_key):
+    try:
+        principal, credential = odin_retrieve_pair(odin_key)
+        if not principal or not credential:
+            Logger.printLogs("ERROR", f"Failed to retrieve ODIN credentials for {service_name}")
+            raise Exception(f"Failed to retrieve ODIN credentials for {service_name}")
+        return boto3.client(service_name, aws_access_key_id=principal.data.decode('utf-8'), aws_secret_access_key=credential.data.decode('utf-8'), region_name='us-east-1')
+    except Exception as e:
+        Logger.printLogs("ERROR", f"Failed to get ODIN credentials: {str(e)}")
+        raise
+
+def clean_s3_bucket(s3_client, bucket):
+    try:
+        objects = s3_client.list_objects_v2(Bucket=bucket).get('Contents', [])
+        if objects:
+            s3_client.delete_objects(Bucket=bucket, Delete={'Objects': [{'Key': obj['Key']} for obj in objects]})
+        Logger.printLogs("INFO", "S3 bucket cleaned.")
+    except Exception as e:
+        Logger.printLogs("ERROR", f"Failed to clean S3 bucket: {str(e)}")
+
+def process_athena_data(query, success_message, script_date, onboarded_leaders):
+    try:
+        s3_client = get_aws_client('s3', ATHENA_CONSTANT.ATHENA_ODIN)
+        athena_client = get_aws_client('athena', ATHENA_CONSTANT.ATHENA_ODIN)
+        if not s3_client or not athena_client:
+            return 1
+
+        clean_s3_bucket(s3_client, ATHENA_CONSTANT.S3_BUCKET)
+
+        leaders_string = ", ".join(f"'{leader}'" for leader in onboarded_leaders)
+        query_formatted = query.format(leaders_string, PIPELINE_DEPLOYMENT.WEEKS_TO_FETCH)
+        Logger.printLogs("INFO", f"Formatted Athena query: {query_formatted}")
+
+        s3_output_location = ATHENA_CONSTANT.S3_PATH.format(script_date)
+        
+        if fetch_athena_query(query_formatted, s3_output_location, ATHENA_CONSTANT.ATHENA_ODIN) == 1:
+            return 1
+        
+        Logger.printLogs("SUCCESS", success_message)
+
+        response = s3_client.list_objects_v2(Bucket=ATHENA_CONSTANT.S3_BUCKET, Prefix=s3_output_location.split(ATHENA_CONSTANT.S3_BUCKET + '/')[1])
+        csv_file = next((obj for obj in response.get('Contents', []) if obj['Key'].endswith('.csv')), None)
+        
+        if not csv_file:
+            Logger.printLogs("ERROR", "No CSV file found in S3 bucket")
+            return 1
+
+        s3_target_key = f"{S3_CONSTANTS.S3_FOLDER.format(script_date)}/processed_athena_results.csv".replace(f"s3://{S3_CONSTANTS.S3_BUCKET}/", "")
+        s3_client.copy({'Bucket': ATHENA_CONSTANT.S3_BUCKET, 'Key': csv_file['Key']}, S3_CONSTANTS.S3_BUCKET, s3_target_key)
+
+        s3_client.head_object(Bucket=S3_CONSTANTS.S3_BUCKET, Key=s3_target_key)
+        Logger.printLogs("INFO", f"File successfully copied to {S3_CONSTANTS.S3_BUCKET}/{s3_target_key}")
+
+        return 0
+
+    except Exception as e:
+        Logger.printLogs("ERROR", f"Failed to process Athena data: {str(e)}")
+        return 1
+
+def fetch_athena_query(query, s3_output_location, odin_key):
+    try:
+        athena_client = get_aws_client('athena', odin_key)
+        if not athena_client:
+            return 1
+
+        response = athena_client.start_query_execution(QueryString=query, ResultConfiguration={'OutputLocation': s3_output_location})  
+        execution_id = response['QueryExecutionId']
+        Logger.printLogs("INFO", f"Execution ID: \"{execution_id}\"")
+        
+        while True:
+            status = athena_client.get_query_execution(QueryExecutionId=execution_id)
+            state = status['QueryExecution']['Status']['State']
+            Logger.printLogs("INFO", state)
+            
+            if state == 'SUCCEEDED':
+                return 0
+            if state in ['FAILED', 'CANCELLED']:
+                Logger.printLogs("ERROR", f"Athena query failed: {status['QueryExecution']['Status'].get('StateChangeReason', 'No error message provided')}")
+                return 1
+            time.sleep(10)
+
+    except Exception as e:
+        Logger.printLogs("ERROR", f"Error executing Athena query: {str(e)}")
+        return 1
+
+def execute_redshift_query(redshift_query, operation):
+    try:
+        rs_obj = redshiftUtilitiesForUpsert() 
+        rs_conn = rs_obj.getRedshiftConnection(ODIN.PMET_REDSHIFT_ODIN, Common_Constants.AEE_OE_PRIVATE_REDSHIFT_HOST, Common_Constants.RedShift_Port, Common_Constants.RedShift_Database)
+        if not rs_conn or rs_conn == 1:
+            Logger.printLogs("ERROR", "Failed to establish Redshift connection")
+            return 1
+        result = rs_obj.executeRedshiftQuery(redshift_query, rs_conn)
+        if isinstance(result, int) and result == 1:
+            Logger.printLogs("ERROR", f"Error in executing {operation} - Query: {redshift_query}")
+            return 1
+        Logger.printLogs("SUCCESS", f"{operation} executed successfully")
+        Logger.printLogs("INFO", f"{operation} result: {result}")
+        return result
+    except Exception as e:
+        Logger.printLogs("ERROR", f"Unable to perform {operation} - Query: {redshift_query}. Exception: {str(e)}")
+        return 1
+
+def athena_upload_s3file_to_redshift(run_date, metric_type):
+    try:
+        s3_folder = ATHENA_CONSTANT.S3_FOLDER.format(run_date)
+        Logger.printLogs("INFO", f"Downloading from S3: {ATHENA_CONSTANT.S3_BUCKET}/{s3_folder}")
+        
+        s3_target_key = f"{S3_CONSTANTS.S3_FOLDER.format(run_date)}/processed_athena_results.csv".replace(f"s3://{S3_CONSTANTS.S3_BUCKET}/", "")
+        
+        target_table = (REDSHIFT_TABLE.DAYS_SINCE_MERGE 
+                       if metric_type == 'days_since_last_merge' 
+                       else REDSHIFT_TABLE.INVENTORY_AGE)
+         
+        rs_obj = REDSHIFT_LOAD()
+        rs_conn = rs_obj.get_redshift_connection(ODIN.PMET_REDSHIFT_ODIN, Common_Constants.RedShift_Database, Common_Constants.AEE_OE_PRIVATE_REDSHIFT_HOST, int(Common_Constants.RedShift_Port))
+        if rs_conn == 1:
+            Logger.printLogs("ERROR", "Failed to establish Redshift connection")
+            return 1
+
+        with rs_conn.cursor() as cursor:
+            schema, table = target_table.split('.')
+            cursor.execute(REDSHIFT_QUERIES.GET_TABLE_COLUMNS, (schema, table))
+            columns = cursor.fetchall()
+            if not columns:
+                Logger.printLogs("ERROR", f"Table {target_table} does not exist or has no columns")
+                return 1
+            
+            actual_columns = [col[0] for col in columns if col[0] != 'rundate']
+            date_column = next((col for col in actual_columns if col in ['week_start', 'data_date']), None)
+            if not date_column:
+                Logger.printLogs("ERROR", f"Could not find a suitable date column in {target_table}")
+                return 1
+
+            # Delete old rows
+            delete_query = REDSHIFT_QUERIES.DELETE_OLD_ROWS.format(target_table, date_column)
+            cursor.execute(delete_query)
+            Logger.printLogs("INFO", f"Deleted old rows from {target_table}")
+
+            # Load new data
+            s3_file_location = f"s3://{S3_CONSTANTS.S3_BUCKET}/{s3_target_key}"
+            copy_cmd = REDSHIFT_QUERIES.COPY_CMD.format(
+                target_table=target_table,
+                column_names=', '.join(actual_columns),
+                s3_file_location=s3_file_location
+            )
+            cursor.execute(copy_cmd)
+            Logger.printLogs("INFO", f"Copied new data into {target_table}")
+
+            # Update rundate
+            update_query = REDSHIFT_QUERIES.UPDATE_RUNDATE.format(target_table=target_table)
+            cursor.execute(update_query)
+            cursor.execute(REDSHIFT_QUERIES.COPY_COUNT.format(target_table=target_table))
+            row_count = cursor.fetchone()[0]
+            
+            rs_conn.commit()
+            Logger.printLogs("SUCCESS", f"Updated {target_table} with {row_count} rows")
+
+        return 0
+
+    except Exception as e:
+        Logger.printLogs("ERROR", f"Error in athena_upload_s3file_to_redshift: {str(e)}")
+        return 1
+
+def get_redshift_data(redshift_query):
+    try:
+        rs_obj = REDSHIFT_OPERATION()
+        rs_conn = rs_obj.get_redshift_connection(ODIN.PMET_REDSHIFT_ODIN, Common_Constants.RedShift_Database, Common_Constants.AEE_OE_PRIVATE_REDSHIFT_HOST,int(Common_Constants.RedShift_Port))
+        result = rs_obj.retrieveDataFromRedshift(redshift_query, rs_conn)
+        if result == 1:
+            Logger.printLogs("Error", "Error occurred while fetching data from Redshift.")
+            return None
+        result = json.loads(str(result).replace("'None'", "None").replace("None", "'None'").replace("'", "\""))
+        Logger.printLogs("SUCCESS", f"Data From Redshift is Successfully fetched. Row count: {len(result)}")
+        return result
+    except Exception as e:
+        Logger.printLogs("ERROR", f"Error in Getting data from Redshift. Exception: {e}")
+        raise
+
+def aggregate_data_in_redshift():
+    try:
+        aggregate_query = PIPELINE_DEPLOYMENT.AGGREGATE_TABLE_UPDATE.format(REDSHIFT_TABLE.AGGREGATE_TABLE, REDSHIFT_TABLE.DAYS_SINCE_MERGE, REDSHIFT_TABLE.INVENTORY_AGE)
+        if execute_redshift_query(aggregate_query, "Aggregate data") == 1:
+            return None
+
+        Logger.printLogs("SUCCESS", "Data aggregated successfully in Redshift.")
+        
+        fetch_query = REDSHIFT_QUERIES.FETCH_AGGREGATE_DATA.format(REDSHIFT_TABLE.AGGREGATE_TABLE)
+        aggregate_data = get_redshift_data(fetch_query)
+        
+        if not aggregate_data:
+            Logger.printLogs("ERROR", "Failed to retrieve aggregated data from Redshift")
+            return 1
+
+        return aggregate_data
+
+    except Exception as e:
+        Logger.printLogs("ERROR", f"Failed to aggregate data in Redshift: {str(e)}")
+        return 1
+
+def generate_html_table(data, manager_aliases):
+    try:
+        df = pd.DataFrame(data)
+        df['data_date'] = pd.to_datetime(df['data_date'])
+        df['days_since_last_merge'] = pd.to_numeric(df['days_since_last_merge'], errors='coerce')
+        df['inventory_age'] = pd.to_numeric(df['inventory_age'], errors='coerce')
+
+        df = df.sort_values(['manager', 'data_date'])
+        df = df.groupby(['manager', 'week_start']).last().reset_index()
+        weeks = sorted(df['week_start'].unique(), reverse=True)
+        weeks = weeks[:5]
+        df = df[df['week_start'].isin(weeks)]
+        grey_statuses = get_all_manager_grey_statuses()
+        if not grey_statuses:
+            Logger.printLogs("WARNING", "No grey status data available, using default alternating colors")
+
+        # Create pivot tables
+        pivot_days = df.pivot(index='manager', columns='week_start', values='days_since_last_merge')
+        pivot_inventory = df.pivot(index='manager', columns='week_start', values='inventory_age')
+
+        # check all weeks are present
+        for pivot in [pivot_days, pivot_inventory]:
+            for week in weeks:
+                if week not in pivot.columns:
+                    pivot[week] = None
+            pivot = pivot[weeks]
+
+        all_managers = list(manager_aliases)
+        pivot_days = pivot_days.reindex(all_managers)
+        pivot_inventory = pivot_inventory.reindex(all_managers)
+
+        html_table = """
+        <table cellpadding="0" cellspacing="0" border="0" width="100%" style="table-layout: fixed;">
+            <tr>
+                <td style="padding: 0;">
+                    <table cellpadding="8" cellspacing="0" border="1" width="100%" 
+                           style="border-collapse: collapse; font-family: Arial, sans-serif; font-size: 12px; border: 2px solid #333333;">
+        """
+
+        # Header section
+        html_table += """
+        <thead>
+            <tr>
+                <th rowspan="2" width="120" align="left" bgcolor="#f5f5f5" 
+                    style="border: 1px solid #333333; font-weight: bold; font-family: Arial, sans-serif;">
+                    <table cellpadding="0" cellspacing="0" border="0" width="100%">
+                        <tr><td align="left" style="font-weight: bold;">L7 alias</td></tr>
+                    </table>
+                </th>
+        """
+
+        for metric in ["Days Since Last Merge p100 week(s)", "Inventory Age p90 week(s)"]:
+            html_table += f"""
+                <th colspan="{len(weeks)}" align="center" bgcolor="#f5f5f5" 
+                    style="border: 1px solid #333333; font-weight: bold; font-family: Arial, sans-serif;">
+                    <table cellpadding="0" cellspacing="0" border="0" width="100%">
+                        <tr><td align="center" style="font-weight: bold;">{metric}</td></tr>
+                    </table>
+                </th>
+            """
+        html_table += "</tr><tr>"
+
+        for _ in range(2):
+            for week in weeks:
+                formatted_date = week_to_date(week)
+                html_table += f"""
+                    <th width="80" align="center" bgcolor="#f5f5f5" 
+                        style="border: 1px solid #333333; font-weight: bold; font-family: Arial, sans-serif;">
+                        <table cellpadding="0" cellspacing="0" border="0" width="100%">
+                            <tr><td align="center" style="font-weight: bold;">{formatted_date}</td></tr>
+                        </table>
+                    </th>
+                """
+        html_table += "</tr></thead><tbody>"
+
+        for index, manager in enumerate(all_managers):
+            bg_color = '#d9d9d9' if grey_statuses.get(manager, False) else ('#f9f9f9' if index % 2 == 0 else '#ffffff')
+            
+            html_table += f"""
+                <tr bgcolor="{bg_color}">
+                    <td align="left" style="border: 1px solid #333333; font-family: Arial, sans-serif;">
+                        <table cellpadding="0" cellspacing="0" border="0" width="100%">
+                            <tr><td align="left">{manager}</td></tr>
+                        </table>
+                    </td>
+            """
+            # Days Since Last Merge data
+            for week in weeks:
+                value = pivot_days.loc[manager, week] if manager in pivot_days.index else None
+                formatted_value = f"{value:.2f}" if pd.notna(value) else '-'
+                color = '#ff0000' if pd.notna(value) and value > 4 else '#000000'
+                
+                html_table += f"""
+                    <td align="right" style="border: 1px solid #333333; font-family: Arial, sans-serif;">
+                        <table cellpadding="0" cellspacing="0" border="0" width="100%">
+                            <tr><td align="right" style="color: {color};">{formatted_value}</td></tr>
+                        </table>
+                    </td>
+                """
+            # Inventory Age data
+            for week in weeks:
+                value = pivot_inventory.loc[manager, week] if manager in pivot_inventory.index else None
+                formatted_value = f"{value:.2f}" if pd.notna(value) else '-'
+                color = '#ff0000' if pd.notna(value) and value > 4 else '#000000'
+                
+                html_table += f"""
+                    <td align="right" style="border: 1px solid #333333; font-family: Arial, sans-serif;">
+                        <table cellpadding="0" cellspacing="0" border="0" width="100%">
+                            <tr><td align="right" style="color: {color};">{formatted_value}</td></tr>
+                        </table>
+                    </td>
+                """
+            html_table += "</tr>"
+
+        html_table += """
+                        </tbody>
+                    </table>
+                </td>
+            </tr>
+        </table>
+        """
+        return html_table
+
+    except Exception as e:
+        Logger.printLogs("ERROR", f"Failed to generate HTML table: {str(e)}")
+        Logger.printLogs("ERROR", f"Exception details: {traceback.format_exc()}")
+        return "<p>Error generating table. Please check the log for details.</p>"
+
+def get_active_managers():
+    query = REDSHIFT_QUERIES.GET_ACTIVE_MANAGERS.format(managers_table=PIPELINE_DEPLOYMENT.MANAGERS_TABLE)
+    result = get_redshift_data(query)
+    return {row['alias']: row['email'] for row in result} if result else {}
+
+def get_cc_recipients():
+    query = REDSHIFT_QUERIES.GET_CC_RECIPIENTS.format(managers_table=PIPELINE_DEPLOYMENT.MANAGERS_TABLE)
+    result = get_redshift_data(query)
+    cc_dict = {}
+    for row in result:
+        if row['cc_for'] not in cc_dict:
+            cc_dict[row['cc_for']] = []
+        cc_dict[row['cc_for']].append(row['email'])
+    return cc_dict
+
+def get_all_manager_grey_statuses():
+    try:
+        query = REDSHIFT_QUERIES.GET_GREY_STATUSES.format(managers_table=PIPELINE_DEPLOYMENT.MANAGERS_TABLE)
+        rs_obj = REDSHIFT_OPERATION()
+        rs_conn = rs_obj.get_redshift_connection(ODIN.PMET_REDSHIFT_ODIN, Common_Constants.RedShift_Database, Common_Constants.AEE_OE_PRIVATE_REDSHIFT_HOST, int(Common_Constants.RedShift_Port))
+        result = rs_obj.retrieveDataFromRedshift(query, rs_conn)
+        
+        if result == 1:
+            Logger.printLogs("ERROR", "Error fetching grey statuses")
+            return {}
+        
+        if not result:
+            Logger.printLogs("ERROR", "No managers found in the managers table")
+            return 1
+        
+        grey_statuses = {row['alias']: row['is_grey'] for row in result}
+        Logger.printLogs("INFO", f"Successfully fetched grey statuses for {len(grey_statuses)} managers")
+        return grey_statuses
+            
+    except Exception as e:
+        Logger.printLogs("ERROR", f"Error getting grey statuses: {str(e)}")
+        return {}
+
+def week_to_date(week_str):
+    year = int(week_str.split('-')[0])
+    week_num = int(week_str.split('W')[1])
+    first_day = datetime.strptime(f'{year}-W{week_num}-1', '%Y-W%W-%w')
+    return first_day.strftime('%d %b\'%y')
+
+def send_email(data, is_test_run, test_email_id, test_cc_email, active_managers, cc_recipients, quip_link):
+    try:
+        default_cc = EMAIL_CONSTANTS.DEFAULT_CC
+        
+        if is_test_run.lower() == "test":
+            TO_LIST = test_email_id if test_email_id else default_cc
+            CC_LIST = test_cc_email if test_cc_email else TO_LIST  
+        else:
+            TO_LIST = ','.join(active_managers.values())
+            
+            all_cc_emails = set()
+            for manager_alias in active_managers.keys():
+                manager_cc = cc_recipients.get(manager_alias, [])
+                if manager_cc:
+                    all_cc_emails.update(manager_cc)
+                else:
+                    all_cc_emails.add(default_cc)
+            
+            CC_LIST = ','.join(all_cc_emails)
+
+        msg = MIMEMultipart('alternative')
+        msg['Subject'] = EMAIL_CONSTANTS.SUBJECT_TEMPLATE.format(datetime.now().strftime('%b-%Y'))
+        msg['From'] = EMAIL_CONSTANTS.FROM_ADDRESS
+        msg['To'] = TO_LIST
+        msg['Cc'] = CC_LIST
+
+        html_table = generate_html_table(data, list(active_managers.keys()))
+
+        html_content = f"""
+        <html>
+        <body>
+            <p>Hi,</p>
+            <p>Please find the "Pipeline Health - Merge and Deploy Frequency" status update for the last 5 weeks.</p>
+            {html_table}
+            <p><b>Metric Thresholds:</b></p>
+            <ul>
+                <li>Metrics with values > 4 weeks are highlighted in RED (Days Since Last Merge, Inventory Age)</li>
+            </ul>
+            <p>&emsp;Please refer the <a href='{EMAIL_CONSTANTS.DASHBOARD_LINK}'>Release efficiency dashboard</a> - which provides comprehensive pipeline health insights including:</p>
+            <ul>
+                {EMAIL_CONSTANTS.DASHBOARD_INSIGHTS}
+            </ul>
+            <p>Kindly add your callouts to the provided Quip document link: <a href="{quip_link}">{quip_link}</a></p>
+            <p>For any clarification or suggestion, please reach out to {EMAIL_CONSTANTS.SUPPORT_EMAIL}.</p>
+            <p>Regards,<br>AEE-SE Team</p>
+        </body>
+        </html>
+        """
+
+        msg.attach(MIMEText(html_content, 'html'))
+
+        sc = AmazonSecureSMTPClient('no-reply-aee-se-oe')
+        all_recipients = f"{TO_LIST},{CC_LIST}".strip(',')
+        sc.send_email(all_recipients, msg.as_string())
+        
+        Logger.printLogs("INFO", f"Email sent successfully to: {TO_LIST}")
+        Logger.printLogs("INFO", f"CC: {CC_LIST}")
+        Logger.printLogs("INFO", f"Test Run: {is_test_run}")
+        return 0
+    except Exception as e:
+        Logger.printLogs("ERROR", f"Failed to send email: {str(e)}")
+        return 1
+
+def orchestrator():
+    args = parseFlags()
+    script_date = datetime.now().date()
+    is_test_run = args['isTestRun']
+    test_email_id = args.get('testEmailId')
+    test_cc_email = args.get('testCcEmail')
+    quip_link = args.get('quipLink')
+    try:
+        Logger.printLogs("INFO", "[PIPELINE DEPLOYMENT STATUS - START]")
+        Logger.printLogs("INFO", f"Pipeline Deployment Status Script Starts Running - RunDate : {script_date}")
+
+        active_managers = get_active_managers()
+        cc_recipients = get_cc_recipients()
+
+        for query_type, query in [("days_since_last_merge", ATHENA_QUERY.FETCH_DAYS_SINCE_LAST_MERGE),
+                                  ("inventory_age", ATHENA_QUERY.FETCH_INVENTORY_AGE)]:
+            Logger.printLogs("INFO", f"Processing {query_type} data")
+            if process_athena_data(query, f"[RAW DATA] {query_type} data downloaded from Athena to S3.",
+                                   script_date, active_managers.keys()) == 1:
+                return 1
+            
+            Logger.printLogs("INFO", f"Starting S3 to Redshift upload for {query_type}")
+            if athena_upload_s3file_to_redshift(script_date, query_type) == 1:
+                return 1
+            Logger.printLogs("INFO", f"Completed S3 to Redshift upload for {query_type}")
+
+        Logger.printLogs("INFO", "Aggregating data in Redshift")
+        aggregate_manager_data = aggregate_data_in_redshift()
+        if not aggregate_manager_data:
+            Logger.printLogs("ERROR", "Failed to aggregate data in Redshift.")
+            return 1
+
+        Logger.printLogs("INFO", "Sending email report")
+        if send_email(aggregate_manager_data, is_test_run, test_email_id, test_cc_email, active_managers, cc_recipients, quip_link) == 1:
+            return 1
+
+        Logger.printLogs("SUCCESS", "[PIPELINE DEPLOYMENT STATUS - END] Pipeline Deployment Status Refresh Completed Successfully")
+        return 0
+
+    except Exception as e:
+        Logger.printLogs("ERROR", f"Exception occurred while running Pipeline Deployment Status script: {str(e)}")
+        return 1
+        
+if __name__ == "__main__":
+    orchestrator()
+ ______________________________________________________ 
+from aee_oe_data_collector_aggregator_config.config.basic_config import ODIN
+
+class EMAIL_CONSTANTS:
+    DEFAULT_CC = 'aee-se-primary@amazon.com'
+    FROM_ADDRESS = 'no-reply-aee-se-oe@amazon.com'
+    SUBJECT_TEMPLATE = "Pipeline Health Status Report for {}"
+    DASHBOARD_LINK = 'https://pipelines.amazon.com/dashboard/'
+    SUPPORT_EMAIL = 'aee-se-team@amazon.com'
+    DASHBOARD_INSIGHTS = """
+        <li><b>Days Since Last Merge:</b> Days Since Last Merge measures the time since the last merge from the tracking version set.</li>
+        <li><b>Inventory Age Analysis:</b> Inventory Age measures the age of the oldest revision in a pipeline which hasn’t released everywhere.</li>
+    """
+class PIPELINE_DEPLOYMENT:
+    MANAGERS_TABLE = '"rawdata_schema"."pipeline_deployment_report_managers_table"'
+    WEEKS_TO_FETCH = 4
+
+    AGGREGATE_TABLE_UPDATE = """
+    INSERT INTO {0} (manager, week_start, days_since_last_merge, inventory_age, data_date, rundate)
+    SELECT 
+        COALESCE(d.leader_login, i.leader_login) as manager,
+        COALESCE(d.week_start, i.week_start) as week_start,
+        d.metric_value as days_since_last_merge,
+        i.metric_value as inventory_age,
+        COALESCE(d.data_date, i.data_date) as data_date,
+        CURRENT_DATE as rundate
+    FROM 
+        {1} d
+    FULL OUTER JOIN 
+        {2} i
+    ON 
+        d.leader_login = i.leader_login AND d.week_start = i.week_start
+    WHERE 
+        COALESCE(d.week_start, i.week_start) >= DATE_TRUNC('week', CURRENT_DATE - INTERVAL '4 weeks')
+    """
+
+class ATHENA_QUERY:
+    FETCH_INVENTORY_AGE = """
+    WITH ranked_data AS (
+      SELECT
+        leader_login,
+        time_period_value,
+        time_period_end_date AS data_date,
+        ROUND(CAST(metric_value AS DOUBLE) / 7.0, 2) AS inventory_age_weeks,
+        ROW_NUMBER() OVER (PARTITION BY leader_login 
+                           ORDER BY time_period_end_date DESC) as week_rank
+      FROM "nightingale_gold_subscription_prod_us_east_1_db"."sdh_pipeline_inventory_age_p90_v2_0"
+      WHERE time_period = 'report_week'
+        AND leader_login IN ({0})
+        AND is_active = 'true'
+        AND is_naws = 'Show All'
+        AND is_prod = 'Show All'
+        AND dogma_classification = 'Show All'
+    )
+    SELECT
+      leader_login,
+      time_period_value AS week_start,
+      data_date,
+      inventory_age_weeks AS metric_value
+    FROM ranked_data
+    WHERE week_rank <= {1}
+    ORDER BY leader_login, data_date DESC
+    """
+
+    FETCH_DAYS_SINCE_LAST_MERGE = """
+    WITH ranked_data AS (
+      SELECT
+        leader_login,
+        time_period_value,
+        time_period_end_date AS data_date,
+        ROUND(CAST(metric_value AS DOUBLE) / 7.0, 2) AS inventory_age_weeks,
+        ROW_NUMBER() OVER (PARTITION BY leader_login 
+                           ORDER BY time_period_end_date DESC) as week_rank
+      FROM "nightingale_gold_subscription_prod_us_east_1_db"."sdh_pipeline_days_since_last_merge_p100_v1_0"
+      WHERE time_period = 'report_week'
+        AND leader_login IN ({0})
+        AND is_active = 'true'
+        AND is_naws = 'Show All'
+        AND is_prod = 'Show All'
+        AND dogma_classification = 'Show All'
+    )
+    SELECT
+      leader_login,
+      time_period_value AS week_start,
+      data_date,
+      inventory_age_weeks AS metric_value
+    FROM ranked_data
+    WHERE week_rank <= {1}
+    ORDER BY leader_login, data_date DESC
+    """
+
+class REDSHIFT_QUERIES:
+    DELETE_OLD_ROWS = """
+    DELETE FROM {0} 
+    WHERE {1} >= DATE_TRUNC('week', CURRENT_DATE - INTERVAL '4 weeks')
+    """
+    
+    COPY_CMD = """
+    COPY {target_table} ({column_names})
+    FROM '{s3_file_location}'
+    IAM_ROLE 'arn:aws:iam::899085032812:role/PmetRedshiftRole'
+    FORMAT AS CSV
+    DATEFORMAT 'YYYY-MM-DD'
+    TIMEFORMAT 'auto'
+    IGNOREHEADER 1
+    """
+
+    UPDATE_RUNDATE = """
+    UPDATE {target_table}
+    SET rundate = CURRENT_DATE
+    WHERE rundate IS NULL
+    """
+
+    COPY_COUNT = "SELECT COUNT(*) FROM {target_table}"
+
+    GET_TABLE_COLUMNS = """
+    SELECT column_name
+    FROM information_schema.columns
+    WHERE table_schema = %s AND table_name = %s
+    ORDER BY ordinal_position;
+    """
+
+    GET_ACTIVE_MANAGERS = """
+    SELECT alias, alias || '@amazon.com' as email 
+    FROM {managers_table}
+    WHERE is_manager = TRUE AND is_active = TRUE
+    ORDER BY id DESC
+    """
+
+    GET_CC_RECIPIENTS = """
+    SELECT pr.alias, pr.cc_for, pr.alias || '@amazon.com' as email
+    FROM {managers_table} pr
+    JOIN {managers_table} m ON pr.cc_for = m.alias
+    WHERE pr.is_manager = FALSE AND pr.is_active = TRUE AND m.is_active = TRUE
+    """
+
+    FETCH_AGGREGATE_DATA = "SELECT * FROM {0} ORDER BY manager, week_start"
+
+    GET_GREY_STATUSES = """
+    SELECT alias, 
+           COALESCE(is_grey, FALSE) as is_grey 
+    FROM {managers_table}
+    WHERE is_manager = TRUE AND is_active = TRUE
+    """
+
+class ATHENA_CONSTANT:
+    S3_BUCKET = "merge-and-deploy-frequency"
+    S3_PATH = "s3://merge-and-deploy-frequency/pipeline-deployment-status_{0}/athena_output/"
+    ATHENA_CATALOG = "AwsDataCatalog"
+    S3_FOLDER = "pipeline-deployment-status_{0}"
+    ATHENA_DB = "nightingale_gold_subscription_prod_us_east_1_db"
+    ATHENA_WORKGROUP = "AmazonAthenaPreviewFunctionality"
+    ATHENA_ODIN = ODIN.AEE_ODIN
+
+class REDSHIFT_TABLE:
+    DAYS_SINCE_MERGE = "rawdata_schema.days_since_last_merge_table"
+    INVENTORY_AGE = "rawdata_schema.inventory_age_table"
+    AGGREGATE_TABLE = "aggregate_schema.merge_from_live_aggregate_table"
+
+class S3_CONSTANTS:
+    S3_BUCKET = "merge-and-deploy-frequency"
+    S3_FOLDER = "s3://merge-and-deploy-frequency/filtered-pipeline-deployment-status_{0}/filtered_data"
+    S3_FILE_RAW_DATA = "merge_from_live_raw_data.csv"
+    S3_FILE_AGGREGATE = "merge_from_live_aggregate_data.csv"
